@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
@@ -20,11 +23,15 @@ import (
 	"warp-mihomo/internal/pool"
 )
 
-// Prepare parses the next config and inserts its new proxies into the live
-// map without changing warp-pool. New exits can dial their front by name.
-// The returned restore puts the previous map back.
+// Prepare parses the next proxies and inserts the new ones into the live map
+// without changing warp-pool. New exits can dial their front by name. The
+// returned restore puts the previous map back.
+//
+// config.Parse is intentionally not used. It temporarily rewrites process-global
+// dialer state, including routing-mark, and auto-redirect uses that mark to keep
+// the front's own sockets out of the TUN.
 func Prepare(raw []byte) (cfg *config.Config, restore func(), err error) {
-	cfg, err = config.Parse(raw)
+	cfg, err = parseProxyConfig(raw)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -42,6 +49,44 @@ func Prepare(raw []byte) (cfg *config.Config, restore func(), err error) {
 		closeNew(cfg, previous)
 	}
 	return cfg, restore, nil
+}
+func parseProxyConfig(raw []byte) (*config.Config, error) {
+	rawCfg, err := config.UnmarshalRawConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	proxies := map[string]C.Proxy{
+		"DIRECT":      adapter.NewProxy(outbound.NewDirect()),
+		"REJECT":      adapter.NewProxy(outbound.NewReject()),
+		"REJECT-DROP": adapter.NewProxy(outbound.NewRejectDrop()),
+		"COMPATIBLE":  adapter.NewProxy(outbound.NewCompatible()),
+		"PASS":        adapter.NewProxy(outbound.NewPass()),
+		"PASS-RULE":   adapter.NewProxy(outbound.NewPassRule()),
+	}
+	providers := make(map[string]P.ProxyProvider)
+	names := make([]string, 0, len(rawCfg.Proxy))
+	for idx, mapping := range rawCfg.Proxy {
+		proxy, err := adapter.ParseProxy(mapping)
+		if err != nil {
+			return nil, fmt.Errorf("proxy %d: %w", idx, err)
+		}
+		if _, exists := proxies[proxy.Name()]; exists {
+			return nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
+		}
+		proxies[proxy.Name()] = proxy
+		names = append(names, proxy.Name())
+	}
+	for idx, mapping := range rawCfg.ProxyGroup {
+		group, err := outboundgroup.ParseProxyGroup(mapping, proxies, providers, names, nil)
+		if err != nil {
+			return nil, fmt.Errorf("proxy group %d: %w", idx, err)
+		}
+		if _, exists := proxies[group.Name()]; exists {
+			return nil, fmt.Errorf("proxy group %s: the duplicate name", group.Name())
+		}
+		proxies[group.Name()] = adapter.NewProxy(group)
+	}
+	return &config.Config{Proxies: proxies, Providers: providers}, nil
 }
 
 // Promote points warp-pool at the parsed group. Call it only after Prepare

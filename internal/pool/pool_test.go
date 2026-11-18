@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -121,17 +122,51 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 	if next[0].Server == first[0].Server || next[1].Server == first[1].Server {
 		t.Fatalf("address was not rotated: %s %s", next[0].Server, next[1].Server)
 	}
+	pending, err := load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeGeneration(pending) != first[0].Generation {
+		t.Fatalf("unprobed generation %d became active", activeGeneration(pending))
+	}
+	recovered, err := Ensure(dir, 1, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered[0].Name != first[0].Name || calls != 4 {
+		t.Fatalf("restart kept the unprobed generation: %+v calls %d", recovered, calls)
+	}
+	next, err = Rotate(dir, 1, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 6 {
+		t.Fatalf("calls %d", calls)
+	}
+	if err := Activate(dir, next[0].Generation); err != nil {
+		t.Fatal(err)
+	}
 	again, err := Ensure(dir, 1, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again[0].Name != next[0].Name || calls != 4 {
-		t.Fatalf("ensure re-enrolled after rotate: %+v calls %d", again, calls)
+	if again[0].Name != next[0].Name || calls != 6 {
+		t.Fatalf("ensure re-enrolled after activate: %+v calls %d", again, calls)
 	}
-	if !GenerationIdle([]string{first[0].Name, first[1].Name}, nil) {
-		t.Fatal("idle generation reported busy")
+	state, err := load(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if GenerationIdle([]string{first[0].Name, first[1].Name}, [][]string{{"warp-pool", first[1].Name}}) {
+	for _, dev := range state.Devices {
+		if dev.Generation != next[0].Generation {
+			t.Fatalf("inactive generation survived restart: %+v", dev)
+		}
+	}
+	exits := []string{first[1].Name}
+	if !GenerationIdle(exits, [][]string{{first[0].Name}}) {
+		t.Fatal("front transport blocked retirement")
+	}
+	if GenerationIdle(exits, [][]string{{"warp-pool", first[1].Name}}) {
 		t.Fatal("live exit was treated as idle")
 	}
 }
@@ -163,8 +198,23 @@ func TestYAMLParsesAsMihomo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v\n%s", err, raw)
 	}
-	if !cfg.General.Tun.Enable || !cfg.General.Tun.AutoRoute || !cfg.General.Tun.AutoDetectInterface {
+	if !cfg.General.Tun.Enable || !cfg.General.Tun.AutoRoute || !cfg.General.Tun.AutoDetectInterface || !cfg.General.Tun.AutoRedirect {
 		t.Fatalf("tun %+v", cfg.General.Tun)
+	}
+	if len(cfg.General.Tun.RouteAddressSet) != 0 {
+		t.Fatalf("public capture set %v", cfg.General.Tun.RouteAddressSet)
+	}
+	if len(cfg.General.Tun.RouteExcludeAddressSet) != 1 || cfg.General.Tun.RouteExcludeAddressSet[0] != localSet {
+		t.Fatalf("exclude set %v", cfg.General.Tun.RouteExcludeAddressSet)
+	}
+	if !hasPrefix(cfg.General.Tun.RouteExcludeAddress, "172.16.0.0/12") || !hasPrefix(cfg.General.Tun.RouteExcludeAddress, "fc00::/7") {
+		t.Fatalf("exclude prefixes %v", cfg.General.Tun.RouteExcludeAddress)
+	}
+	if _, ok := cfg.RuleProviders[localSet]; !ok {
+		t.Fatal("missing local address set")
+	}
+	if len(cfg.Rules) != len(localCIDRs)+1 || cfg.Rules[len(cfg.Rules)-1].RuleType().String() != "Match" {
+		t.Fatalf("rules %d last %s", len(cfg.Rules), cfg.Rules[len(cfg.Rules)-1].RuleType())
 	}
 	if cfg.General.Tun.Stack != C.TunMips {
 		t.Fatalf("stack %s", cfg.General.Tun.Stack)
@@ -200,6 +250,14 @@ func TestYAMLParsesAsMihomo(t *testing.T) {
 	if !strings.Contains(text, "warp-exit-1") || !strings.Contains(text, "warp-exit-2") || strings.Contains(text, FrontName) {
 		t.Fatalf("group %s", text)
 	}
+}
+func hasPrefix(prefixes []netip.Prefix, cidr string) bool {
+	for _, prefix := range prefixes {
+		if prefix.String() == cidr {
+			return true
+		}
+	}
+	return false
 }
 
 func mustDevice(t *testing.T, role, name string) Device {

@@ -171,6 +171,7 @@ func getenvBool(key string, fallback bool) bool {
 type retiredGen struct {
 	gen   int
 	names []string
+	exits []string
 }
 
 func rotateEvery() (time.Duration, error) {
@@ -231,11 +232,15 @@ func rotateOnce(data string, exits int, tun bool, current []pool.Device) ([]pool
 	if err != nil {
 		return nil, nil, rollback(data, current, next, err)
 	}
-	names := make([]string, len(next)-1)
+	probe := make([]string, len(next)-1)
 	for i, dev := range next[1:] {
-		names[i] = dev.Name
+		probe[i] = dev.Name
 	}
-	if err := reload.Probe(cfg, names); err != nil {
+	if err := reload.Probe(cfg, probe); err != nil {
+		restore()
+		return nil, nil, rollback(data, current, next, err)
+	}
+	if err := pool.Activate(data, next[0].Generation); err != nil {
 		restore()
 		return nil, nil, rollback(data, current, next, err)
 	}
@@ -247,12 +252,16 @@ func rotateOnce(data string, exits int, tun bool, current []pool.Device) ([]pool
 		fmt.Fprintf(os.Stderr, "rotate: wrote live proxies but not mihomo.yaml: %v\n", err)
 	}
 	old := make([]string, len(current))
+	oldExits := make([]string, 0, len(current)-1)
 	for i, dev := range current {
 		old[i] = dev.Name
+		if dev.Role == pool.RoleExit {
+			oldExits = append(oldExits, dev.Name)
+		}
 		fmt.Fprintf(os.Stderr, "rotate %s %s -> %s %s\n", dev.Name, dev.Server, next[min(i, len(next)-1)].Name, next[min(i, len(next)-1)].Server)
 	}
 	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", next[0].Generation, current[0].Generation)
-	return next, &retiredGen{gen: current[0].Generation, names: old}, nil
+	return next, &retiredGen{gen: current[0].Generation, names: old, exits: oldExits}, nil
 }
 
 func rollback(data string, current, failed []pool.Device, cause error) error {
@@ -275,7 +284,7 @@ func reapRetired(data string, retired []retiredGen) []retiredGen {
 	kept := retired[:0]
 	chains := liveChains()
 	for _, hold := range retired {
-		if !pool.GenerationIdle(hold.names, chains) {
+		if !pool.GenerationIdle(hold.exits, chains) {
 			kept = append(kept, hold)
 			continue
 		}

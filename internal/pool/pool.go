@@ -73,6 +73,8 @@ func Lock(dir string) (func(), error) {
 
 // Ensure loads identities from dir and enrolls only the deficit.
 // exits is the number of devices behind the front, not counting the front.
+// Generations other than the active one are removed: a restart has no live
+// sessions, and an uncommitted rotation must not keep its addresses.
 // The directory lock must already be held.
 func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 	if exits < minExits || exits > maxExits {
@@ -82,11 +84,26 @@ func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 	if err != nil {
 		return nil, err
 	}
+	gen := activeGeneration(state)
+	kept := make([]Device, 0, len(state.Devices))
+	dropped := false
+	for _, dev := range state.Devices {
+		if dev.Generation == gen {
+			kept = append(kept, dev)
+			continue
+		}
+		dropped = true
+	}
+	if dropped {
+		state.Devices = kept
+		if err := save(dir, state); err != nil {
+			return nil, err
+		}
+	}
 	used, err := usedOctets(state.Devices)
 	if err != nil {
 		return nil, err
 	}
-	gen := activeGeneration(state)
 	if !hasGenerationRole(state.Devices, gen, RoleFront) {
 		id, err := reg(frontName(gen))
 		if err != nil {
@@ -121,7 +138,8 @@ func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 	return selectGeneration(state.Devices, gen, exits)
 }
 
-// Rotate enrolls a new generation on fresh endpoint addresses and makes it active.
+// Rotate enrolls a new generation on fresh endpoint addresses without making it
+// active. The caller activates it only after the generation dials successfully.
 // The previous generation stays in the file so its live sessions can finish.
 func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 	if exits < minExits || exits > maxExits {
@@ -157,7 +175,6 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 		}
 		state.Devices = append(state.Devices, dev)
 	}
-	state.ActiveGeneration = &gen
 	if err := save(dir, state); err != nil {
 		return nil, err
 	}
@@ -314,8 +331,9 @@ func selectGeneration(devices []Device, gen, exits int) ([]Device, error) {
 }
 
 // GenerationIdle reports whether none of the names appear in live connection chains.
-// A front is busy while any exit from the same generation is busy, because those
-// exits are dialed through it.
+// Pass the generation's exit names. A front-only chain is the exit transport, not
+// a consumer, and must not keep the generation alive. An exit is busy while any
+// consumer chain names it; its front stays up until those exits are closed.
 func GenerationIdle(names []string, chains [][]string) bool {
 	busy := map[string]struct{}{}
 	for _, chain := range chains {

@@ -1,9 +1,9 @@
 # warp-mihomo
 
-One container runs mihomo with a TUN. Other containers use `network_mode: "service:warp-mihomo"` and share that network namespace, so their traffic enters the TUN.
+One container runs mihomo with a TUN. Other containers use `network_mode: "service:warp-mihomo"` and share that network namespace. Linux auto-redirect mark mode captures public egress, including sockets explicitly bound to the namespace address. Loopback, link-local, private, CGNAT, ULA, IPv4 multicast, and the TUN range stay on the container network. Mihomo marks the front's own dials so those sockets still leave through the container NIC.
 
-The pool is one direct MASQUE front plus N exits. Each exit has `dialer-proxy: warp-front`. Round-robin is across exits. A restart reuses `devices.json`; it does not enroll again unless the exit count grew.
-`WARP_ROTATE` defaults to `1h` (`0` disables it). Each tick enrolls a new front and exits on fresh `162.159.198.x` addresses, dials one new exit, then points `warp-pool` at that generation. The TUN is not recreated and already-open flows stay on the previous MASQUE sessions. Those sessions are closed only after their connection chains go idle.
+The pool is one direct MASQUE front plus N exits. Each exit has `dialer-proxy: warp-front`. Round-robin is across exits. A restart reuses `devices.json`, drops generations that are no longer active, and does not enroll again unless the exit count grew.
+`WARP_ROTATE` defaults to `1h` (`0` disables it). Each tick enrolls a new front and exits on fresh `162.159.198.x` addresses, dials one new exit, then points `warp-pool` at that generation. The generation becomes active only after that dial. The TUN is not recreated and already-open flows stay on the previous MASQUE sessions. Those sessions are closed only after no consumer chain names their exits; the front transport alone does not keep the generation alive.
 
 
 ```sh

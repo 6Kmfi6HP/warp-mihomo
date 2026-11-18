@@ -8,8 +8,10 @@ import (
 
 // YAML renders a mihomo config. The front dials MASQUE directly. Each exit
 // sets dialer-proxy to the front, and the load-balance group contains only
-// exits. TUN auto-route takes the network namespace; auto-detect-interface
-// binds the front's own dial to the container NIC so it does not re-enter TUN.
+// exits. With TUN, auto-redirect mark mode captures public egress, including
+// sockets bound to a namespace address. Local destinations are excluded before
+// DNS hijack and stay on the container network. Mihomo marks its own dials so
+// the front still leaves through the container NIC.
 func YAML(devices []Device, tun bool) ([]byte, error) {
 	if len(devices) < 2 || devices[0].Role != RoleFront {
 		return nil, fmt.Errorf("yaml wants the front first, then exits")
@@ -27,6 +29,15 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 	b.WriteString("  stack: mips\n")
 	b.WriteString("  auto-route: true\n")
 	b.WriteString("  auto-detect-interface: true\n")
+	if tun {
+		b.WriteString("  auto-redirect: true\n")
+		b.WriteString("  route-exclude-address:\n")
+		for _, cidr := range localCIDRs {
+			b.WriteString("    - " + strconv.Quote(cidr) + "\n")
+		}
+		b.WriteString("  route-exclude-address-set:\n")
+		b.WriteString("    - " + localSet + "\n")
+	}
 	b.WriteString("  dns-hijack:\n")
 	b.WriteString("    - any:53\n")
 	b.WriteString("    - tcp://any:53\n")
@@ -69,7 +80,25 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 		b.WriteString("      - " + d.Name + "\n")
 	}
 	b.WriteString("\n")
+	if tun {
+		b.WriteString("rule-providers:\n")
+		b.WriteString("  " + localSet + ":\n")
+		b.WriteString("    type: inline\n")
+		b.WriteString("    behavior: ipcidr\n")
+		b.WriteString("    payload:\n")
+		for _, cidr := range localCIDRs {
+			b.WriteString("      - " + strconv.Quote(cidr) + "\n")
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("rules:\n")
+	for _, cidr := range localCIDRs {
+		kind := "IP-CIDR"
+		if strings.Contains(cidr, ":") {
+			kind = "IP-CIDR6"
+		}
+		fmt.Fprintf(&b, "  - %s,%s,DIRECT,no-resolve\n", kind, cidr)
+	}
 	b.WriteString("  - MATCH," + PoolName + "\n")
 	return []byte(b.String()), nil
 }
@@ -101,4 +130,27 @@ func writeProxy(b *strings.Builder, d Device, dialer string) error {
 	b.WriteString("      - 1.1.1.1\n")
 	b.WriteString("      - 1.0.0.1\n")
 	return nil
+}
+
+const localSet = "warp-local"
+
+// localCIDRs are destinations that stay on the container network. The same
+// list is installed before sing-tun's DNS hijack and as the rule-provider that
+// enables auto-redirect mark mode. Prefixes must not touch: sing-tun encodes
+// each range as [start, end), so an end that equals the next start is rejected.
+// A range ending at the last address is also rejected. 198.18.0.0/15 is this
+// stack's TUN range.
+var localCIDRs = []string{
+	"0.0.0.0/8",
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"198.18.0.0/15",
+	"224.0.0.0/4",
+	"::/127",
+	"fc00::/7",
+	"fe80::/10",
 }

@@ -6,8 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"sync/atomic"
 	"testing"
 
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/tunnel"
 
@@ -51,6 +54,46 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	}
 	if tunnel.Proxies()["warp-exit-1"].Addr() != "162.159.198.3:443" {
 		t.Fatal("old exit was removed while it should stay reachable")
+	}
+}
+func TestPreparePreservesRoutingMark(t *testing.T) {
+	C.SetHomeDir(t.TempDir())
+	const mark int32 = 0x2023
+	oldMark := dialer.DefaultRoutingMark.Load()
+	oldIPv6 := resolver.DisableIPv6
+	dialer.DefaultRoutingMark.Store(mark)
+	resolver.DisableIPv6 = true
+	defer func() {
+		dialer.DefaultRoutingMark.Store(oldMark)
+		resolver.DisableIPv6 = oldIPv6
+	}()
+	var changed atomic.Bool
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if dialer.DefaultRoutingMark.Load() != mark || !resolver.DisableIPv6 {
+				changed.Store(true)
+			}
+		}
+	}()
+	cfg, restore, err := Prepare(mustYAML(t, "warp-front", "162.159.198.2", "warp-exit-1", "162.159.198.3"))
+	close(stop)
+	if restore != nil {
+		defer restore()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Proxies[pool.PoolName] == nil {
+		t.Fatal("missing pool")
+	}
+	if changed.Load() || dialer.DefaultRoutingMark.Load() != mark || !resolver.DisableIPv6 {
+		t.Fatal("prepare changed process-global dialer settings")
 	}
 }
 
