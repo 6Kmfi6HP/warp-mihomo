@@ -1,0 +1,39 @@
+# Other containers join this network namespace. Publish ports here, not on them.
+# dns is 1.1.1.1 so lookups hit port 53 and the TUN hijack, instead of
+# Docker's 127.0.0.11 resolver.
+services:
+  warp-mihomo:
+    build: .
+    image: warp-mihomo
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      WARP_EXITS: "3"
+      WARP_ROTATE: ${WARP_ROTATE:-1h}
+      SKIP_SYSTEM_IPV6_CHECK: "1"
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    volumes:
+      - warp-data:/data
+    healthcheck:
+      test: ["CMD", "warp-mihomo", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  app:
+    image: alpine:3.21
+    network_mode: "service:warp-mihomo"
+    depends_on:
+      warp-mihomo:
+        condition: service_healthy
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+volumes:
+  warp-data:

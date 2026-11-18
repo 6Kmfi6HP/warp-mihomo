@@ -1,0 +1,17 @@
+# enrolled devices, generated config, mihomo runtime
+/data/
+devices.json
+devices.json.tmp
+devices.lock
+mihomo.yaml
+cache.db
+
+# local build
+/warp-mihomo
+*.exe
+
+# env
+.env
+.env.*
+
+.DS_Store
