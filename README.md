@@ -15,6 +15,8 @@ docker compose exec app wget -qO- https://1.1.1.1/cdn-cgi/trace
 
 `WARP_TUN=0 ./warp-mihomo run` starts without a TUN. Enrollment accepts the Cloudflare terms of service.
 
+For production Docker Compose setup, configuration options, verification, and troubleshooting, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## Release
 
 Versions are annotated or lightweight git tags `vMAJOR.MINOR.PATCH`. A `-rc.1` suffix is a prerelease. Pushing the tag runs the release workflow: tests, a native `linux/amd64` and `linux/arm64` image build, a push to `ghcr.io/6kmfi6hp/warp-mihomo`, then a GitHub Release. `main` publishes the moving tag `edge` and does not move `latest`.
