@@ -14,3 +14,16 @@ docker compose exec app wget -qO- https://1.1.1.1/cdn-cgi/trace
 `WARP_EXITS` is the exit count, from 1 to 16, default 3. The front is extra. v4 addresses in one colo still collide; v6 is per device. The destination sees the exit, not the front.
 
 `WARP_TUN=0 ./warp-mihomo run` starts without a TUN. Enrollment accepts the Cloudflare terms of service.
+
+## Release
+
+Versions are annotated or lightweight git tags `vMAJOR.MINOR.PATCH`. A `-rc.1` suffix is a prerelease. Pushing the tag runs the release workflow: tests, a native `linux/amd64` and `linux/arm64` image build, a push to `ghcr.io/6kmfi6hp/warp-mihomo`, then a GitHub Release. `main` publishes the moving tag `edge` and does not move `latest`.
+
+`0.1.2` is that release. `0.1` tracks the newest patch in that minor. `1` tracks the newest stable `v1`; there is no `0` tag while the major is 0. `latest` tracks the newest stable release, not a prerelease and not `edge`. `edge` tracks `main`. `sha-` plus the short commit pins the commit that published `edge` or a version.
+
+`warp-mihomo version` prints the version without the leading `v`, the full commit, and the commit time. A local build that does not pass those build args prints `dev`. The first package pushed to GHCR is private until its visibility is changed.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```

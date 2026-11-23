@@ -1,0 +1,140 @@
+# Versions are git tags vMAJOR.MINOR.PATCH, with an optional -prerelease suffix.
+# Pushing the tag builds and pushes the image, then opens the GitHub Release.
+# Pushes to main publish the moving tag edge and do not move latest.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  stamp:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      revision: ${{ steps.meta.outputs.revision }}
+      created: ${{ steps.meta.outputs.created }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+      - name: Resolve version
+        id: meta
+        run: |
+          set -eu
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if ! printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+              echo "tag must be semver vMAJOR.MINOR.PATCH" >&2
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            version=edge
+          else
+            version=dev
+          fi
+          {
+            echo "version=${version}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(git log -1 --pretty=%cI)"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: CGO_ENABLED=0 go test -tags with_gvisor ./...
+
+  image:
+    needs: [stamp, test]
+    uses: docker/github-builder/.github/workflows/build.yml@a31d2311da4d55e21b978c1c52bab82ba97d51ee # v1
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      output: image
+      push: ${{ github.event_name != 'pull_request' }}
+      platforms: linux/amd64,linux/arm64
+      fail-fast: true
+      cache: true
+      cache-mode: max
+      sbom: true
+      set-meta-labels: true
+      set-meta-annotations: true
+      job-name-prefix: warp-mihomo
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-tags: |
+        type=edge,branch=main,enable=${{ github.ref == 'refs/heads/main' }}
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
+        type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+        type=sha
+      meta-labels: |
+        org.opencontainers.image.title=warp-mihomo
+        org.opencontainers.image.description=mihomo TUN with a rotating WARP MASQUE pool
+      annotations: |
+        index:org.opencontainers.image.title=warp-mihomo
+        index:org.opencontainers.image.description=mihomo TUN with a rotating WARP MASQUE pool
+        index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+      build-args: |
+        VERSION=${{ needs.stamp.outputs.version }}
+        REVISION=${{ needs.stamp.outputs.revision }}
+        CREATED=${{ needs.stamp.outputs.created }}
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+  github-release:
+    needs: image
+    if: ${{ github.ref_type == 'tag' && needs.image.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -eu
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):${version}"
+          if [ -n "$IMAGE_DIGEST" ]; then
+            image="${image}@${IMAGE_DIGEST}"
+          fi
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            args=(release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$tag")
+            case "$tag" in
+              *-*) args+=(--prerelease) ;;
+            esac
+            gh "${args[@]}"
+          fi
+          body="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+          if ! printf '%s\n' "$body" | grep -Fq "$image"; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes "${body}
+
+          ${image}"
+          fi

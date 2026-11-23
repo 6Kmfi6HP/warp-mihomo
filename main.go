@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 
+	"warp-mihomo/internal/buildinfo"
 	"warp-mihomo/internal/health"
 	"warp-mihomo/internal/pool"
 	"warp-mihomo/internal/reload"
@@ -35,6 +36,13 @@ func main() {
 		err = enroll(os.Args[2:])
 	case "health":
 		err = doHealth()
+	case "version":
+		if len(os.Args) != 2 {
+			usage()
+			os.Exit(2)
+		}
+		fmt.Print(buildinfo.Text())
+		return
 	default:
 		usage()
 		os.Exit(2)
@@ -47,6 +55,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: warp-mihomo run|enroll|health [-data dir] [-exits n] [-tun]")
+	fmt.Fprintln(os.Stderr, "       warp-mihomo version")
 }
 
 func run(args []string) error {
