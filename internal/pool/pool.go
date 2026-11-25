@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,10 +27,12 @@ const (
 	FrontName = "warp-front"
 	PoolName  = "warp-pool"
 
-	minExits   = 1
-	maxExits   = 16
-	masquePort = 443
+	minExits = 1
+	maxExits = 16
 )
+
+// masquePorts are the TCP/UDP ports Cloudflare WARP MASQUE endpoints listen on.
+var masquePorts = []int{443, 500, 1701, 4443, 4500, 8095, 8443}
 
 // Device is one enrolled MASQUE identity plus the anycast address it dials.
 type Device struct {
@@ -100,7 +104,7 @@ func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 			return nil, err
 		}
 	}
-	used, err := usedOctets(state.Devices)
+	endpoints, err := newEndpointPool(state.Devices, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +113,7 @@ func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 		if err != nil {
 			return nil, fmt.Errorf("enroll front: %w", err)
 		}
-		dev, err := newDevice(RoleFront, frontName(gen), gen, id, used)
+		dev, err := newDevice(RoleFront, frontName(gen), gen, id, endpoints)
 		if err != nil {
 			return nil, err
 		}
@@ -125,7 +129,7 @@ func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 		if err != nil {
 			return nil, fmt.Errorf("enroll %s: %w", name, err)
 		}
-		dev, err := newDevice(RoleExit, name, gen, id, used)
+		dev, err := newDevice(RoleExit, name, gen, id, endpoints)
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +154,7 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 		return nil, err
 	}
 	gen := maxGeneration(state.Devices) + 1
-	used, err := usedOctets(state.Devices)
+	endpoints, err := newEndpointPool(state.Devices, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +162,7 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 	if err != nil {
 		return nil, fmt.Errorf("enroll front: %w", err)
 	}
-	front, err := newDevice(RoleFront, frontName(gen), gen, id, used)
+	front, err := newDevice(RoleFront, frontName(gen), gen, id, endpoints)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +173,7 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 		if err != nil {
 			return nil, fmt.Errorf("enroll %s: %w", name, err)
 		}
-		dev, err := newDevice(RoleExit, name, gen, id, used)
+		dev, err := newDevice(RoleExit, name, gen, id, endpoints)
 		if err != nil {
 			return nil, err
 		}
@@ -181,11 +185,71 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 	return selectGeneration(state.Devices, gen, exits)
 }
 
-func newDevice(role, name string, gen int, id warp.Identity, used map[int]bool) (Device, error) {
+type endpointPool struct {
+	octets   map[int]bool
+	allPorts map[int]int
+	genPorts map[int]int
+}
+
+func newEndpointPool(devices []Device, gen int) (*endpointPool, error) {
+	octets, err := usedOctets(devices)
+	if err != nil {
+		return nil, err
+	}
+	allPorts := make(map[int]int, len(masquePorts))
+	genPorts := make(map[int]int, len(masquePorts))
+	for _, d := range devices {
+		if !slices.Contains(masquePorts, d.Port) {
+			continue
+		}
+		allPorts[d.Port]++
+		if d.Generation == gen {
+			genPorts[d.Port]++
+		}
+	}
+	return &endpointPool{
+		octets:   octets,
+		allPorts: allPorts,
+		genPorts: genPorts,
+	}, nil
+}
+
+// pickPort selects a supported MASQUE port, prioritizing ports unused in the
+// current generation and then ports unused across all stored generations.
+func (p *endpointPool) pickPort() (int, error) {
+	bestGen := -1
+	bestAll := -1
+	var candidates []int
+	for _, port := range masquePorts {
+		gc := p.genPorts[port]
+		ac := p.allPorts[port]
+		if bestGen == -1 || gc < bestGen || (gc == bestGen && ac < bestAll) {
+			bestGen = gc
+			bestAll = ac
+			candidates = append(candidates[:0], port)
+		} else if gc == bestGen && ac == bestAll {
+			candidates = append(candidates, port)
+		}
+	}
+	idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(candidates))))
+	if err != nil {
+		return 0, err
+	}
+	port := candidates[idx.Int64()]
+	p.genPorts[port]++
+	p.allPorts[port]++
+	return port, nil
+}
+
+func newDevice(role, name string, gen int, id warp.Identity, endpoints *endpointPool) (Device, error) {
 	if id.PrivateKey == "" || id.PublicKey == "" || id.IP == "" || id.IPv6 == "" {
 		return Device{}, fmt.Errorf("enrollment %s returned an empty field", name)
 	}
-	octet, err := pickOctet(used)
+	octet, err := pickOctet(endpoints.octets)
+	if err != nil {
+		return Device{}, err
+	}
+	port, err := endpoints.pickPort()
 	if err != nil {
 		return Device{}, err
 	}
@@ -198,7 +262,7 @@ func newDevice(role, name string, gen int, id warp.Identity, used map[int]bool) 
 		IP:         id.IP,
 		IPv6:       id.IPv6,
 		Server:     fmt.Sprintf("162.159.198.%d", octet),
-		Port:       masquePort,
+		Port:       port,
 	}, nil
 }
 

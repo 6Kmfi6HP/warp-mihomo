@@ -20,7 +20,7 @@
 
 - **宿主机系统**：Linux（需内核支持 `/dev/net/tun` 及 `nftables`/`iptables` mark 路由）。
 - **容器运行时**：Docker Engine + Docker Compose v2。
-- **网络连通性**：宿主机出站需允许访问 Cloudflare WARP 注册接口、MASQUE 服务（`162.159.198.x:443` / `consumer-masque.cloudflareclient.com`）以及 `1.1.1.1:443`。
+- **网络连通性**：宿主机出站需允许访问 Cloudflare WARP 注册接口、MASQUE 服务（`162.159.198.x` 的 `443` / `500` / `1701` / `4443` / `4500` / `8095` / `8443` 端口，`consumer-masque.cloudflareclient.com`）以及 `1.1.1.1:443`。
 - **镜像拉取权限**：镜像发布在 `ghcr.io/6kmfi6hp/warp-mihomo`。如果仓库的 GHCR Package 仍为 Private，需先在宿主机执行 `docker login ghcr.io`，或在 GitHub Package 设置中将其改为 Public。
 
 ---
@@ -195,8 +195,8 @@ docker compose up -d
    - 处理：在宿主机执行 `sudo modprobe tun` 并确认 `/dev/net/tun` 存在，同时核对 Compose 中的 `cap_add` 与 `devices` 配置。
 
 3. **健康检查一直处于 `starting` 或 `unhealthy`**
-   - 原因：首次启动需要向 Cloudflare 注册 `1 + WARP_EXITS` 个设备并探测连通性；或宿主机无法直连 Cloudflare `443` 端口。
-   - 处理：查看 `docker compose logs warp-mihomo` 报错详情；确认宿主机防火墙放行 UDP/TCP 出站 `443`，并适当保留 `start_period: 90s`。
+   - 原因：首次启动需要向 Cloudflare 注册 `1 + WARP_EXITS` 个设备并探测连通性；或宿主机无法直连 Cloudflare MASQUE 端口。
+   - 处理：查看 `docker compose logs warp-mihomo` 报错详情；确认宿主机防火墙放行 UDP/TCP 出站 `443, 500, 1701, 4443, 4500, 8095, 8443`，并适当保留 `start_period: 90s`。
 
 4. **业务容器 DNS 解析异常或未走 WARP**
    - 原因：业务容器未正确配置 `network_mode: "service:warp-mihomo"`，或未在 `warp-mihomo` 上配置 `dns: [1.1.1.1, 1.0.0.1]`。

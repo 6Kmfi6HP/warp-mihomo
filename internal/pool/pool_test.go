@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -48,14 +49,19 @@ func TestEnsureFillsOnce(t *testing.T) {
 		t.Fatalf("exits %+v", got[1:])
 	}
 	seen := map[string]bool{}
+	seenPorts := map[int]bool{}
 	for _, d := range got {
 		if seen[d.Server] {
 			t.Fatalf("duplicate server %s", d.Server)
 		}
 		seen[d.Server] = true
-		if d.Port != 443 {
-			t.Fatalf("port %d", d.Port)
+		if !slices.Contains(masquePorts, d.Port) {
+			t.Fatalf("unsupported port %d", d.Port)
 		}
+		if seenPorts[d.Port] {
+			t.Fatalf("duplicate port %d", d.Port)
+		}
+		seenPorts[d.Port] = true
 	}
 
 	unlock, err = Lock(dir)
@@ -85,6 +91,57 @@ func TestEnsureFillsOnce(t *testing.T) {
 	}
 	if calls != 4 || len(grown) != 4 || grown[3].Name != "warp-exit-3" {
 		t.Fatalf("grow calls %d devices %+v", calls, grown)
+	}
+	if grown[3].Port == got[0].Port || grown[3].Port == got[1].Port || grown[3].Port == got[2].Port {
+		t.Fatalf("grown exit reused port %d in %+v", grown[3].Port, grown)
+	}
+}
+
+func TestDistinctPortsAndOverflowBalance(t *testing.T) {
+	dir := t.TempDir()
+	reg := func(name string) (warp.Identity, error) {
+		return warp.Identity{
+			PrivateKey: "priv-" + name,
+			PublicKey:  "pub-" + name,
+			IP:         "172.16.0.2",
+			IPv6:       "2606:4700:110::" + name,
+		}, nil
+	}
+	unlock, err := Lock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	// 1 front + 6 exits = 7 devices: every node gets a unique supported port.
+	devs, err := Ensure(dir, 6, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int]bool{}
+	for _, d := range devs {
+		if !slices.Contains(masquePorts, d.Port) {
+			t.Fatalf("device %s got unsupported port %d", d.Name, d.Port)
+		}
+		if seen[d.Port] {
+			t.Fatalf("duplicate port %d across %+v", d.Port, devs)
+		}
+		seen[d.Port] = true
+	}
+
+	// Growing past len(masquePorts) stays balanced instead of failing.
+	more, err := Ensure(dir, 8, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[int]int{}
+	for _, d := range more {
+		counts[d.Port]++
+	}
+	for _, p := range masquePorts {
+		if counts[p] < 1 || counts[p] > 2 {
+			t.Fatalf("unbalanced port %d count %d in %+v", p, counts[p], counts)
+		}
 	}
 }
 
@@ -121,6 +178,16 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 	}
 	if next[0].Server == first[0].Server || next[1].Server == first[1].Server {
 		t.Fatalf("address was not rotated: %s %s", next[0].Server, next[1].Server)
+	}
+	rotatedPorts := map[int]bool{first[0].Port: true, first[1].Port: true}
+	for _, d := range next {
+		if !slices.Contains(masquePorts, d.Port) {
+			t.Fatalf("rotated device %s got unsupported port %d", d.Name, d.Port)
+		}
+		if rotatedPorts[d.Port] {
+			t.Fatalf("rotated device %s reused port %d across generations", d.Name, d.Port)
+		}
+		rotatedPorts[d.Port] = true
 	}
 	pending, err := load(dir)
 	if err != nil {

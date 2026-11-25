@@ -19,7 +19,7 @@ import (
 
 func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	C.SetHomeDir(t.TempDir())
-	first := mustYAML(t, "warp-front", "162.159.198.2", "warp-exit-1", "162.159.198.3")
+	first := mustYAML(t, "warp-front", "162.159.198.2", 443, "warp-exit-1", "162.159.198.3", 8095)
 	cfg, restore, err := Prepare(first)
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := tunnel.Proxies()[pool.PoolName]
-	next := mustYAML(t, "warp-front-g1", "162.159.198.40", "warp-exit-g1-1", "162.159.198.41")
+	next := mustYAML(t, "warp-front-g1", "162.159.198.40", 8443, "warp-exit-g1-1", "162.159.198.41", 4500)
 	cfg, restore, err = Prepare(next)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	if _, ok := tunnel.Proxies()["warp-front-g1"]; !ok {
 		t.Fatal("new front was not staged")
 	}
-	if got := tunnel.Proxies()["warp-exit-g1-1"].Addr(); got != "162.159.198.41:443" {
+	if got := tunnel.Proxies()["warp-exit-g1-1"].Addr(); got != "162.159.198.41:4500" {
 		t.Fatalf("staged exit addr %s", got)
 	}
 	if err := Promote(cfg); err != nil {
@@ -52,7 +52,7 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	if tunnel.Proxies()[pool.PoolName] == before {
 		t.Fatal("promote left the old pool in place")
 	}
-	if tunnel.Proxies()["warp-exit-1"].Addr() != "162.159.198.3:443" {
+	if tunnel.Proxies()["warp-exit-1"].Addr() != "162.159.198.3:8095" {
 		t.Fatal("old exit was removed while it should stay reachable")
 	}
 }
@@ -81,7 +81,7 @@ func TestPreparePreservesRoutingMark(t *testing.T) {
 			}
 		}
 	}()
-	cfg, restore, err := Prepare(mustYAML(t, "warp-front", "162.159.198.2", "warp-exit-1", "162.159.198.3"))
+	cfg, restore, err := Prepare(mustYAML(t, "warp-front", "162.159.198.2", 443, "warp-exit-1", "162.159.198.3", 8443))
 	close(stop)
 	if restore != nil {
 		defer restore()
@@ -97,11 +97,11 @@ func TestPreparePreservesRoutingMark(t *testing.T) {
 	}
 }
 
-func mustYAML(t *testing.T, front, frontServer, exit, exitServer string) []byte {
+func mustYAML(t *testing.T, front, frontServer string, frontPort int, exit, exitServer string, exitPort int) []byte {
 	t.Helper()
 	devices := []pool.Device{
-		mustDev(t, pool.RoleFront, front, frontServer),
-		mustDev(t, pool.RoleExit, exit, exitServer),
+		mustDev(t, pool.RoleFront, front, frontServer, frontPort),
+		mustDev(t, pool.RoleExit, exit, exitServer, exitPort),
 	}
 	raw, err := pool.YAML(devices, false)
 	if err != nil {
@@ -110,7 +110,7 @@ func mustYAML(t *testing.T, front, frontServer, exit, exitServer string) []byte 
 	return raw
 }
 
-func mustDev(t *testing.T, role, name, server string) pool.Device {
+func mustDev(t *testing.T, role, name, server string, port int) pool.Device {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -132,6 +132,6 @@ func mustDev(t *testing.T, role, name, server string) pool.Device {
 		IP:         "172.16.0.2",
 		IPv6:       "2606:4700:110::1",
 		Server:     server,
-		Port:       443,
+		Port:       port,
 	}
 }

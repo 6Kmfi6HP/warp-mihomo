@@ -267,7 +267,8 @@ func rotateOnce(data string, exits int, tun bool, current []pool.Device) ([]pool
 		if dev.Role == pool.RoleExit {
 			oldExits = append(oldExits, dev.Name)
 		}
-		fmt.Fprintf(os.Stderr, "rotate %s %s -> %s %s\n", dev.Name, dev.Server, next[min(i, len(next)-1)].Name, next[min(i, len(next)-1)].Server)
+		nxt := next[min(i, len(next)-1)]
+		fmt.Fprintf(os.Stderr, "rotate %s %s:%d -> %s %s:%d\n", dev.Name, dev.Server, dev.Port, nxt.Name, nxt.Server, nxt.Port)
 	}
 	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", next[0].Generation, current[0].Generation)
 	return next, &retiredGen{gen: current[0].Generation, names: old, exits: oldExits}, nil
