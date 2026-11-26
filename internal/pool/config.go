@@ -6,13 +6,20 @@ import (
 	"strings"
 )
 
-// YAML renders a mihomo config. The front dials MASQUE directly. Each exit
+// YAML renders a mihomo config without custom bypass rules.
+func YAML(devices []Device, tun bool) ([]byte, error) {
+	return YAMLWithDirect(devices, tun, DirectRules{})
+}
+
+// YAMLWithDirect renders a mihomo config. The front dials MASQUE directly. Each exit
 // sets dialer-proxy to the front, and the load-balance group contains only
 // exits. With TUN, auto-redirect mark mode captures public egress, including
 // sockets bound to a namespace address. Local destinations are excluded before
-// DNS hijack and stay on the container network. Mihomo marks its own dials so
-// the front still leaves through the container NIC.
-func YAML(devices []Device, tun bool) ([]byte, error) {
+// DNS hijack and stay on the container network. Custom direct targets bypass
+// warp-pool via DIRECT (and direct DoH resolution for domain entries). Mihomo
+// marks its own dials so the front and DIRECT dials still leave through the
+// container NIC.
+func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, error) {
 	if len(devices) < 2 || devices[0].Role != RoleFront {
 		return nil, fmt.Errorf("yaml wants the front first, then exits")
 	}
@@ -51,6 +58,11 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 	b.WriteString("    - 1.1.1.1\n")
 	b.WriteString("  nameserver:\n")
 	b.WriteString("    - \"https://1.1.1.1/dns-query#" + PoolName + "\"\n")
+	if len(direct.Domains) > 0 {
+		b.WriteString("  nameserver-policy:\n")
+		fmt.Fprintf(&b, "    \"rule-set:%s\":\n", directDomainSet)
+		b.WriteString("      - \"https://1.1.1.1/dns-query#DIRECT\"\n")
+	}
 	b.WriteString("  proxy-server-nameserver:\n")
 	b.WriteString("    - 1.1.1.1\n")
 	b.WriteString("\n")
@@ -80,14 +92,25 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 		b.WriteString("      - " + d.Name + "\n")
 	}
 	b.WriteString("\n")
-	if tun {
+	if tun || len(direct.Domains) > 0 {
 		b.WriteString("rule-providers:\n")
-		b.WriteString("  " + localSet + ":\n")
-		b.WriteString("    type: inline\n")
-		b.WriteString("    behavior: ipcidr\n")
-		b.WriteString("    payload:\n")
-		for _, cidr := range localCIDRs {
-			b.WriteString("      - " + strconv.Quote(cidr) + "\n")
+		if tun {
+			b.WriteString("  " + localSet + ":\n")
+			b.WriteString("    type: inline\n")
+			b.WriteString("    behavior: ipcidr\n")
+			b.WriteString("    payload:\n")
+			for _, cidr := range localCIDRs {
+				b.WriteString("      - " + strconv.Quote(cidr) + "\n")
+			}
+		}
+		if len(direct.Domains) > 0 {
+			b.WriteString("  " + directDomainSet + ":\n")
+			b.WriteString("    type: inline\n")
+			b.WriteString("    behavior: domain\n")
+			b.WriteString("    payload:\n")
+			for _, domain := range direct.Domains {
+				b.WriteString("      - " + strconv.Quote(domain) + "\n")
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -98,6 +121,19 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 			kind = "IP-CIDR6"
 		}
 		fmt.Fprintf(&b, "  - %s,%s,DIRECT,no-resolve\n", kind, cidr)
+	}
+	if len(direct.Domains) > 0 {
+		fmt.Fprintf(&b, "  - RULE-SET,%s,DIRECT\n", directDomainSet)
+	}
+	for _, prefix := range direct.CIDRs {
+		kind := "IP-CIDR"
+		if prefix.Addr().Is6() {
+			kind = "IP-CIDR6"
+		}
+		fmt.Fprintf(&b, "  - %s,%s,DIRECT,no-resolve\n", kind, prefix.String())
+	}
+	for _, rule := range direct.Rules {
+		b.WriteString("  - " + rule + "\n")
 	}
 	b.WriteString("  - MATCH," + PoolName + "\n")
 	return []byte(b.String()), nil
@@ -132,7 +168,10 @@ func writeProxy(b *strings.Builder, d Device, dialer string) error {
 	return nil
 }
 
-const localSet = "warp-local"
+const (
+	localSet        = "warp-local"
+	directDomainSet = "warp-direct-domain"
+)
 
 // localCIDRs are destinations that stay on the container network. The same
 // list is installed before sing-tun's DNS hijack and as the rule-provider that

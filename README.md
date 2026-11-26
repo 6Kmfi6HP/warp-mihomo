@@ -15,6 +15,8 @@ docker compose exec app wget -qO- https://1.1.1.1/cdn-cgi/trace
 
 `WARP_TUN=0 ./warp-mihomo run` starts without a TUN. Enrollment accepts the Cloudflare terms of service.
 
+Bypass rules (routing selected domains, CIDRs, or mihomo rules via `DIRECT` instead of `warp-pool`) can be configured with `WARP_DIRECT` (comma-separated domains/CIDRs) and/or a YAML file (`WARP_DIRECT_FILE`, defaulting to `<WARP_DATA>/direct.yaml` if present). Domain entries also resolve DNS directly via `1.1.1.1` DoH.
+
 For production Docker Compose setup, configuration options, verification, and troubleshooting, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Release

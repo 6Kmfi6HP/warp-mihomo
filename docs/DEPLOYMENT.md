@@ -96,7 +96,51 @@ docker compose up -d
 | `WARP_EXITS` | `3` | 出口设备数量，合法范围 `1`–`16`（前置节点额外计 1 个） |
 | `WARP_ROTATE` | `1h` | 自动轮换间隔（Go duration 格式，如 `30m`、`2h`）；设为 `0` 关闭轮换 |
 | `WARP_TUN` | `true` | 是否启用 TUN；设为 `0`、`false` 或 `no` 可关闭 |
+| `WARP_DIRECT` | 空 | 逗号分隔的直连绕过列表（支持域名、`.后缀`/`*.后缀`、IP/CIDR），命中后走 `DIRECT` |
+| `WARP_DIRECT_FILE` | `<WARP_DATA>/direct.yaml` | 直连绕过 YAML 配置文件路径；未显式设置时若默认文件存在则自动加载，显式设置时文件必须存在 |
 | `SKIP_SYSTEM_IPV6_CHECK` | `1`（容器内） | 跳过系统 IPv6 检查，`run` 启动时若为空也会默认设为 `1` |
+
+### 网站/网段直连绕过（`WARP_DIRECT` / `direct.yaml`）
+
+可将指定网站或网段配置为不经过 WARP（走 `DIRECT` 出站），支持与 `WARP_ROTATE` 轮换共存（每次生成 `mihomo.yaml` 时自动注入）：
+
+1. **环境变量方式**（适合少量条目）：
+
+```yaml
+environment:
+  WARP_DIRECT: "www.googleapis.com,drive.googleapis.com,.googleusercontent.com,oauth2.googleapis.com,accounts.google.com"
+```
+
+2. **挂载 YAML 配置文件方式**（推荐用于较多规则，与 `WARP_DIRECT` 可同时叠加）：
+
+新建 `direct.yaml` 并挂载到 `/data/direct.yaml`（或通过 `WARP_DIRECT_FILE` 指定路径）：
+
+```yaml
+# 域名列表：普通域名按精确匹配，. 或 *. 或 +. 开头按后缀匹配（包含主域名与所有子域名）
+# 这里的域名同时会自动配置 dns.nameserver-policy 直连 DoH 解析，不经 warp-pool
+domains:
+  - www.googleapis.com
+  - drive.googleapis.com
+  - .googleusercontent.com
+  - oauth2.googleapis.com
+  - accounts.google.com
+
+# 可选：直连 IP 或 CIDR 网段（生成 IP-CIDR/IP-CIDR6,...,DIRECT,no-resolve）
+cidrs:
+  - 203.0.113.0/24
+
+# 可选：原生 mihomo 规则（无需或仅可填写 DIRECT 作为目标策略，支持 no-resolve）
+rules:
+  - DOMAIN-KEYWORD,example
+```
+
+在 `compose.yaml` 中挂载：
+
+```yaml
+    volumes:
+      - warp-data:/data
+      - ./direct.yaml:/data/direct.yaml:ro
+```
 
 ### 镜像标签策略
 

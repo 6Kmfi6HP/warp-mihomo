@@ -66,6 +66,10 @@ func run(args []string) error {
 	if os.Getenv("SKIP_SYSTEM_IPV6_CHECK") == "" {
 		os.Setenv("SKIP_SYSTEM_IPV6_CHECK", "1")
 	}
+	direct, err := pool.LoadDirect(data, os.Getenv("WARP_DIRECT"), os.Getenv("WARP_DIRECT_FILE"))
+	if err != nil {
+		return err
+	}
 	unlock, err := pool.Lock(data)
 	if err != nil {
 		return err
@@ -75,7 +79,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	raw, err := pool.YAML(devices, tun)
+	raw, err := pool.YAMLWithDirect(devices, tun, direct)
 	if err != nil {
 		return err
 	}
@@ -85,6 +89,9 @@ func run(args []string) error {
 	}
 	C.SetHomeDir(data)
 	fmt.Fprintf(os.Stderr, "mihomo %s devices %d tun %t\n", C.Version, len(devices), tun)
+	if len(direct.Domains) > 0 || len(direct.CIDRs) > 0 || len(direct.Rules) > 0 {
+		fmt.Fprintf(os.Stderr, "direct bypass: %d domains, %d cidrs, %d rules\n", len(direct.Domains), len(direct.CIDRs), len(direct.Rules))
+	}
 	if err := hub.Parse(raw); err != nil {
 		return err
 	}
@@ -96,7 +103,7 @@ func run(args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if interval > 0 {
-		go rotateLoop(ctx, data, exits, tun, interval, devices)
+		go rotateLoop(ctx, data, exits, tun, interval, devices, direct)
 	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -201,7 +208,7 @@ func rotateEvery() (time.Duration, error) {
 	}
 }
 
-func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval time.Duration, current []pool.Device) {
+func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval time.Duration, current []pool.Device, direct pool.DirectRules) {
 	tick := time.NewTicker(interval)
 	reap := time.NewTicker(15 * time.Second)
 	defer tick.Stop()
@@ -213,7 +220,7 @@ func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval 
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			next, hold, err := rotateOnce(data, exits, tun, current)
+			next, hold, err := rotateOnce(data, exits, tun, current, direct)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "rotate: %v\n", err)
 				continue
@@ -228,12 +235,12 @@ func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval 
 	}
 }
 
-func rotateOnce(data string, exits int, tun bool, current []pool.Device) ([]pool.Device, *retiredGen, error) {
+func rotateOnce(data string, exits int, tun bool, current []pool.Device, direct pool.DirectRules) ([]pool.Device, *retiredGen, error) {
 	next, err := pool.Rotate(data, exits, enrollOne)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw, err := pool.YAML(next, tun)
+	raw, err := pool.YAMLWithDirect(next, tun, direct)
 	if err != nil {
 		return nil, nil, rollback(data, current, next, err)
 	}
