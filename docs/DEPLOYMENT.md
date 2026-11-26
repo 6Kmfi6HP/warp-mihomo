@@ -9,10 +9,10 @@
 1. **网络共享**：业务容器通过 `network_mode: "service:warp-mihomo"` 共享 `warp-mihomo` 的网络命名空间。
 2. **透明劫持**：mihomo 启用 `tun`（`stack: mips`、`auto-route: true`、`auto-redirect: true`），在 Linux 下使用 mark 模式接管容器内的公网出站流量及端口 53 的 DNS 请求（`dns-hijack`）。
 3. **直连绕行**：容器内网及保留地址段（`0.0.0.0/8`、`10.0.0.0/8`、`100.64.0.0/10`、`127.0.0.0/8`、`169.254.0.0/16`、`172.16.0.0/12`、`192.168.0.0/16`、`198.18.0.0/15`、`224.0.0.0/4`、`::/127`、`fc00::/7`、`fe80::/10`）保持直连，不进入 WARP。
-4. **双层池化与轮换**：
-   - 池由 M 个直连的 MASQUE 前置节点（组成前置负载均衡组 `warp-front-pool`，轮换代为 `warp-front-pool-g<N>`）和 N 个出口节点（`warp-exit-*`，通过 `dialer-proxy` 经前置负载均衡组建连）组成，后置 `warp-pool` 以 `round-robin` 策略在各出口间轮询。
-   - 目标服务器看到的是出口节点的 IP，而非前置节点 IP；同一接入点下 IPv4 仍可能碰撞，IPv6 按设备独立分配。
-   - 当启用 `WARP_ROTATE` 时，后台会定期注册新一代前置与出口节点、验证全部新前置及至少一个新出口连通后原子切换 `warp-pool`。TUN 不会被重建，既有连接继续在旧代会话上自然排空，全部空闲后再清理旧代设备及旧代前置组。
+4. **双协议同池架构与轮换**：
+   - 池内部按协议分轨：H3（QUIC + `bbr`）前置组成 `warp-front-h3-pool`（轮换代为 `warp-front-h3-pool-g<N>`），供 H3 出口（使用 `162.159.198.1` / `.2` 搭配不同端口）拨号；H2（`network: h2`）前置组成 `warp-front-h2-pool`（轮换代为 `warp-front-h2-pool-g<N>`），供 H2 出口（使用 `162.159.198.3`–`254` 独立 IP）拨号。
+   - 全部 H3 与 H2 出口统一汇入单一 `warp-pool`（`round-robin`）对外负载均衡；目标服务器看到的是出口节点 IP，而非前置节点 IP；同一接入点下 IPv4 仍可能碰撞，IPv6 按设备独立分配。
+   - 当启用 `WARP_ROTATE` 时，后台会定期注册新一代 H3/H2 前置与出口节点、按轨道验证全部新前置及至少一个新出口连通后原子切换 `warp-pool`。TUN 不会被重建，既有连接继续在旧代会话上自然排空，全部空闲后再清理旧代设备及旧代前置组。
 
 ---
 
@@ -38,8 +38,10 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
-      WARP_FRONTS: "1"
-      WARP_EXITS: "3"
+      WARP_FRONTS_H3: "2"
+      WARP_EXITS_H3: "3"
+      WARP_FRONTS_H2: "1"
+      WARP_EXITS_H2: "1"
       WARP_ROTATE: "1h"
       SKIP_SYSTEM_IPV6_CHECK: "1"
     dns:
@@ -94,8 +96,11 @@ docker compose up -d
 | 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
 | `WARP_DATA` | `/data`（容器内） / `data`（本地） | 状态与配置文件目录 |
-| `WARP_FRONTS` | `1` | 前置设备数量，合法范围 `1`–`16`（进入 `warp-front-pool` 负载均衡组） |
-| `WARP_EXITS` | `3` | 出口设备数量，合法范围 `1`–`16`（进入 `warp-pool` 负载均衡组） |
+| `WARP_FRONTS_H3` | `2` | H3 前置设备数量（进入 `warp-front-h3-pool`）；与 `WARP_EXITS_H3` 均设为 `0` 可关闭 H3 轨道 |
+| `WARP_EXITS_H3` | `3` | H3 出口设备数量（进入 `warp-pool`）；需满足 `WARP_FRONTS_H3 + WARP_EXITS_H3 <= 7` |
+| `WARP_FRONTS_H2` | `1` | H2 前置设备数量（进入 `warp-front-h2-pool`）；与 `WARP_EXITS_H2` 均设为 `0` 可关闭 H2 轨道 |
+| `WARP_EXITS_H2` | `1` | H2 出口设备数量（进入 `warp-pool`），合法范围 `0`–`16`（至少保留一条轨道启用） |
+| `WARP_FALLBACK_REG_URL` | `https://usque-register-server.pages.dev/0906?raw=true` | 备用注册端点（m2c.pages.dev 背后的服务）；官方 API 返回 429 限流时，以模拟浏览器（携带该前端 `Origin`/`Referer`）的 GET 方式注册设备；设为 `off` 关闭备用注册 |
 | `WARP_ROTATE` | `1h` | 自动轮换间隔（Go duration 格式，如 `30m`、`2h`）；设为 `0` 关闭轮换 |
 | `WARP_TUN` | `true` | 是否启用 TUN；设为 `0`、`false` 或 `no` 可关闭 |
 | `WARP_DIRECT` | 空 | 逗号分隔的直连绕过列表（支持域名、`.后缀`/`*.后缀`、IP/CIDR），命中后走 `DIRECT` |
@@ -162,7 +167,7 @@ docker compose exec warp-mihomo warp-mihomo version
 docker compose exec warp-mihomo warp-mihomo health
 
 # 仅预先注册设备到数据目录，不启动代理
-docker compose run --rm warp-mihomo enroll -data /data -exits 3
+docker compose run --rm warp-mihomo enroll -data /data -fronts-h3 2 -exits-h3 3 -fronts-h2 1 -exits-h2 1
 ```
 
 ---
@@ -211,10 +216,10 @@ docker compose pull warp-mihomo
 docker compose up -d
 ```
 
-### 调整出口数量（`WARP_EXITS`）
+### 调整设备数量（`WARP_FRONTS_H3` / `WARP_EXITS_H3` / `WARP_FRONTS_H2` / `WARP_EXITS_H2`）
 
-- 修改 `WARP_EXITS` 并执行 `docker compose up -d` 即可生效。
-- 调大数量时会自动补齐注册缺少的出口设备；调小数量时会复用已有活跃设备。
+- 修改对应环境变量并执行 `docker compose up -d` 即可生效。
+- 调大数量时会自动补齐注册缺少的设备；调小数量时会复用已有活跃设备（也可将其中一条轨道的 fronts/exits 同时设为 `0` 以关闭该轨道）。
 
 ### 重置设备状态
 
@@ -241,7 +246,7 @@ docker compose up -d
    - 处理：在宿主机执行 `sudo modprobe tun` 并确认 `/dev/net/tun` 存在，同时核对 Compose 中的 `cap_add` 与 `devices` 配置。
 
 3. **健康检查一直处于 `starting` 或 `unhealthy`**
-   - 原因：首次启动需要向 Cloudflare 注册 `1 + WARP_EXITS` 个设备并探测连通性；或宿主机无法直连 Cloudflare MASQUE 端口。
+   - 原因：首次启动需要向 Cloudflare 注册全部前置与出口设备并探测连通性；或宿主机无法直连 Cloudflare MASQUE 端口。
    - 处理：查看 `docker compose logs warp-mihomo` 报错详情；确认宿主机防火墙放行 UDP/TCP 出站 `443, 500, 1701, 4443, 4500, 8095, 8443`，并适当保留 `start_period: 90s`。
 
 4. **业务容器 DNS 解析异常或未走 WARP**

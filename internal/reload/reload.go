@@ -66,7 +66,7 @@ func parseProxyConfig(raw []byte) (*config.Config, error) {
 	providers := make(map[string]P.ProxyProvider)
 	names := make([]string, 0, len(rawCfg.Proxy))
 	for idx, mapping := range rawCfg.Proxy {
-		proxy, err := adapter.ParseProxy(mapping)
+		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel.Tunnel))
 		if err != nil {
 			return nil, fmt.Errorf("proxy %d: %w", idx, err)
 		}
@@ -110,45 +110,70 @@ func Promote(cfg *config.Config) error {
 	return nil
 }
 
+// ProbeTrack groups the staged fronts and exits of one protocol track.
+type ProbeTrack struct {
+	Name   string
+	Fronts []string
+	Exits  []string
+}
+
 // Probe verifies every staged front directly, then dials staged exits until
 // one reaches the test URL through the staged front pool.
 func Probe(cfg *config.Config, fronts, exits []string) error {
+	return ProbeTracks(cfg, []ProbeTrack{{Name: "default", Fronts: fronts, Exits: exits}})
+}
+
+// ProbeTracks verifies every enabled protocol track: all fronts in each track
+// must succeed, and at least one exit in each track must reach the test URL.
+func ProbeTracks(cfg *config.Config, tracks []ProbeTrack) error {
 	ranges, err := utils.NewUnsignedRanges[uint16]("204")
 	if err != nil {
 		return err
 	}
-	if len(fronts) == 0 {
-		return fmt.Errorf("no front to probe")
+	if len(tracks) == 0 {
+		return fmt.Errorf("no track to probe")
 	}
-	for _, name := range fronts {
-		proxy, ok := cfg.Proxies[name]
-		if !ok {
-			return fmt.Errorf("missing proxy %s", name)
+	for _, track := range tracks {
+		if len(track.Fronts) == 0 {
+			return fmt.Errorf("track %s has no front to probe", track.Name)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		_, err := proxy.URLTest(ctx, "https://www.gstatic.com/generate_204", ranges)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("probe front %s: %w", name, err)
+		for _, name := range track.Fronts {
+			if err := probeProxy(cfg, name, ranges); err != nil {
+				return fmt.Errorf("probe %s front %s: %w", track.Name, name, err)
+			}
+		}
+		var last error
+		for _, name := range track.Exits {
+			last = probeProxy(cfg, name, ranges)
+			if last == nil {
+				break
+			}
+		}
+		if last != nil {
+			return fmt.Errorf("probe %s exits: %w", track.Name, last)
+		}
+		if len(track.Exits) == 0 {
+			return fmt.Errorf("track %s has no exit to probe", track.Name)
 		}
 	}
-	var last error
-	for _, name := range exits {
-		proxy, ok := cfg.Proxies[name]
-		if !ok {
-			return fmt.Errorf("missing proxy %s", name)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		_, last = proxy.URLTest(ctx, "https://www.gstatic.com/generate_204", ranges)
+	return nil
+}
+
+func probeProxy(cfg *config.Config, name string, ranges []utils.Range[uint16]) error {
+	proxy, ok := cfg.Proxies[name]
+	if !ok {
+		return fmt.Errorf("missing proxy %s", name)
+	}
+	var err error
+	for range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, err = proxy.URLTest(ctx, "https://www.gstatic.com/generate_204", ranges)
 		cancel()
-		if last == nil {
+		if err == nil {
 			return nil
 		}
 	}
-	if last == nil {
-		last = fmt.Errorf("no exit to probe")
-	}
-	return last
+	return err
 }
 
 func cloneProxies(in map[string]C.Proxy) map[string]C.Proxy {

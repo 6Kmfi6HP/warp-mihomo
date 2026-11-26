@@ -165,8 +165,10 @@ rules:
 	}
 
 	devices := []Device{
-		mustDevice(t, RoleFront, "warp-front-1"),
-		mustDevice(t, RoleExit, "warp-exit-1"),
+		mustDevice(t, RoleFront, NetworkH3, "warp-front-h3-1", "162.159.198.1", 4443),
+		mustDevice(t, RoleExit, NetworkH3, "warp-exit-h3-1", "162.159.198.2", 8443),
+		mustDevice(t, RoleFront, NetworkH2, "warp-front-h2-1", "162.159.198.10", 4500),
+		mustDevice(t, RoleExit, NetworkH2, "warp-exit-h2-1", "162.159.198.20", 443),
 	}
 	for _, tun := range []bool{true, false} {
 		raw, err := YAMLWithDirect(devices, tun, direct)

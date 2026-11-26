@@ -4,10 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,15 +57,26 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: warp-mihomo run|enroll|health [-data dir] [-fronts n] [-exits n] [-tun]")
+	fmt.Fprintln(os.Stderr, "usage: warp-mihomo run|enroll|health [-data dir] [-fronts-h3 n] [-exits-h3 n] [-fronts-h2 n] [-exits-h2 n] [-tun]")
 	fmt.Fprintln(os.Stderr, "       warp-mihomo version")
 }
 
 type runOptions struct {
-	data   string
-	fronts int
-	exits  int
-	tun    bool
+	data     string
+	frontsH3 int
+	exitsH3  int
+	frontsH2 int
+	exitsH2  int
+	tun      bool
+}
+
+func (o runOptions) spec() pool.Spec {
+	return pool.Spec{
+		FrontsH3: o.frontsH3,
+		ExitsH3:  o.exitsH3,
+		FrontsH2: o.frontsH2,
+		ExitsH2:  o.exitsH2,
+	}
 }
 
 func run(args []string) error {
@@ -82,7 +96,7 @@ func run(args []string) error {
 		return err
 	}
 	defer unlock()
-	devices, err := pool.Ensure(opts.data, opts.fronts, opts.exits, enrollOne)
+	devices, err := pool.Ensure(opts.data, opts.spec(), enrollOne)
 	if err != nil {
 		return err
 	}
@@ -95,7 +109,7 @@ func run(args []string) error {
 		return err
 	}
 	C.SetHomeDir(opts.data)
-	fmt.Fprintf(os.Stderr, "mihomo %s devices %d (fronts %d, exits %d) tun %t\n", C.Version, len(devices), opts.fronts, opts.exits, opts.tun)
+	fmt.Fprintf(os.Stderr, "mihomo %s devices %d (h3: %d fronts/%d exits, h2: %d fronts/%d exits) tun %t\n", C.Version, len(devices), opts.frontsH3, opts.exitsH3, opts.frontsH2, opts.exitsH2, opts.tun)
 	if len(direct.Domains) > 0 || len(direct.CIDRs) > 0 || len(direct.Rules) > 0 {
 		fmt.Fprintf(os.Stderr, "direct bypass: %d domains, %d cidrs, %d rules\n", len(direct.Domains), len(direct.CIDRs), len(direct.Rules))
 	}
@@ -128,7 +142,7 @@ func enroll(args []string) error {
 		return err
 	}
 	defer unlock()
-	devices, err := pool.Ensure(opts.data, opts.fronts, opts.exits, enrollOne)
+	devices, err := pool.Ensure(opts.data, opts.spec(), enrollOne)
 	if err != nil {
 		return err
 	}
@@ -145,25 +159,73 @@ func doHealth() error {
 	return nil
 }
 
+var (
+	enrollMu   sync.Mutex
+	lastEnroll time.Time
+)
+
+// fallbackRegURL is set from -fallback-reg-url / WARP_FALLBACK_REG_URL.
+// Empty disables the fallback.
+var fallbackRegURL = warp.DefaultFallbackRegURL
+
 func enrollOne(name string) (warp.Identity, error) {
-	return warp.Register(context.Background(), name)
+	enrollMu.Lock()
+	defer enrollMu.Unlock()
+	const minGap = 500 * time.Millisecond
+	if !lastEnroll.IsZero() {
+		if wait := minGap - time.Since(lastEnroll); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+	var err error
+	for attempt := range 3 {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 15 * time.Second)
+		}
+		var id warp.Identity
+		id, err = warp.Register(context.Background(), name)
+		lastEnroll = time.Now()
+		if err == nil {
+			return id, nil
+		}
+		if !strings.Contains(err.Error(), "cloudflare 429") {
+			return warp.Identity{}, err
+		}
+		fmt.Fprintf(os.Stderr, "enroll %s rate-limited, retrying (%d/2)...\n", name, attempt+1)
+		if fallbackRegURL == "" {
+			continue
+		}
+		fbID, fbErr := warp.RegisterFallback(context.Background(), fallbackRegURL, name)
+		if fbErr == nil {
+			fmt.Fprintf(os.Stderr, "enroll %s enrolled via fallback registration\n", name)
+			return fbID, nil
+		}
+		fmt.Fprintf(os.Stderr, "enroll %s fallback failed: %v\n", name, fbErr)
+	}
+	return warp.Identity{}, err
 }
 
 func flags(name string, args []string) (runOptions, error) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	data := fs.String("data", getenv("WARP_DATA", "data"), "state directory")
-	fronts := fs.Int("fronts", getenvInt("WARP_FRONTS", 1), "front devices in the front pool")
-	exits := fs.Int("exits", getenvInt("WARP_EXITS", 3), "exit devices in the exit pool")
+	frontsH3 := fs.Int("fronts-h3", getenvInt("WARP_FRONTS_H3", 2), "H3 front devices in the H3 front pool")
+	exitsH3 := fs.Int("exits-h3", getenvInt("WARP_EXITS_H3", 3), "H3 exit devices in warp-pool")
+	frontsH2 := fs.Int("fronts-h2", getenvInt("WARP_FRONTS_H2", 1), "H2 front devices in the H2 front pool")
+	exitsH2 := fs.Int("exits-h2", getenvInt("WARP_EXITS_H2", 1), "H2 exit devices in warp-pool")
 	tun := fs.Bool("tun", getenvBool("WARP_TUN", true), "enable TUN")
+	fallback := fs.String("fallback-reg-url", getenv("WARP_FALLBACK_REG_URL", warp.DefaultFallbackRegURL), "browser-style registration endpoint used when Cloudflare answers 429 (\"off\" disables)")
 	if err := fs.Parse(args); err != nil {
 		return runOptions{}, err
 	}
+	fallbackRegURL = normalizeFallback(*fallback)
 	return runOptions{
-		data:   *data,
-		fronts: *fronts,
-		exits:  *exits,
-		tun:    *tun,
+		data:     *data,
+		frontsH3: *frontsH3,
+		exitsH3:  *exitsH3,
+		frontsH2: *frontsH2,
+		exitsH2:  *exitsH2,
+		tun:      *tun,
 	}, nil
 }
 
@@ -172,6 +234,15 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// normalizeFallback maps the disable spellings of -fallback-reg-url to "".
+func normalizeFallback(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "off", "none", "disabled", "0":
+		return ""
+	}
+	return strings.TrimSpace(v)
 }
 
 func getenvInt(key string, fallback int) int {
@@ -249,7 +320,7 @@ func rotateLoop(ctx context.Context, opts runOptions, interval time.Duration, cu
 }
 
 func rotateOnce(opts runOptions, current []pool.Device, direct pool.DirectRules) ([]pool.Device, *retiredGen, error) {
-	next, err := pool.Rotate(opts.data, opts.fronts, opts.exits, enrollOne)
+	next, err := pool.Rotate(opts.data, opts.spec(), enrollOne)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -261,18 +332,16 @@ func rotateOnce(opts runOptions, current []pool.Device, direct pool.DirectRules)
 	if err != nil {
 		return nil, nil, rollback(opts.data, current, next, err)
 	}
-	fronts, exits, nextGen, err := pool.SplitRoles(next)
+	plan, err := pool.SplitPlan(next)
 	if err != nil {
 		restore()
 		return nil, nil, rollback(opts.data, current, next, err)
 	}
-	probeFronts := deviceNames(fronts)
-	probeExits := deviceNames(exits)
-	if err := reload.Probe(cfg, probeFronts, probeExits); err != nil {
+	if err := reload.ProbeTracks(cfg, buildProbeTracks(plan)); err != nil {
 		restore()
 		return nil, nil, rollback(opts.data, current, next, err)
 	}
-	if err := pool.Activate(opts.data, nextGen); err != nil {
+	if err := pool.Activate(opts.data, plan.Gen); err != nil {
 		restore()
 		return nil, nil, rollback(opts.data, current, next, err)
 	}
@@ -283,8 +352,10 @@ func rotateOnce(opts runOptions, current []pool.Device, direct pool.DirectRules)
 	if err := os.WriteFile(filepath.Join(opts.data, "mihomo.yaml"), raw, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "rotate: wrote live proxies but not mihomo.yaml: %v\n", err)
 	}
-	oldGen := current[0].Generation
-	old := make([]string, 0, len(current)+1)
+	oldPlan, _ := pool.SplitPlan(current)
+	oldGen := oldPlan.Gen
+	oldGroupNames := oldPlan.FrontGroupNames()
+	old := make([]string, 0, len(current)+len(oldGroupNames))
 	oldExits := make([]string, 0, len(current))
 	for i, dev := range current {
 		old = append(old, dev.Name)
@@ -292,11 +363,30 @@ func rotateOnce(opts runOptions, current []pool.Device, direct pool.DirectRules)
 			oldExits = append(oldExits, dev.Name)
 		}
 		nxt := next[min(i, len(next)-1)]
-		fmt.Fprintf(os.Stderr, "rotate %s %s:%d -> %s %s:%d\n", dev.Name, dev.Server, dev.Port, nxt.Name, nxt.Server, nxt.Port)
+		fmt.Fprintf(os.Stderr, "rotate %s %s -> %s %s\n", dev.Name, net.JoinHostPort(dev.Server, strconv.Itoa(dev.Port)), nxt.Name, net.JoinHostPort(nxt.Server, strconv.Itoa(nxt.Port)))
 	}
-	old = append(old, pool.FrontGroupName(oldGen))
-	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", nextGen, oldGen)
+	old = append(old, oldGroupNames...)
+	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", plan.Gen, oldGen)
 	return next, &retiredGen{gen: oldGen, names: old, exits: oldExits}, nil
+}
+
+func buildProbeTracks(plan pool.Plan) []reload.ProbeTrack {
+	var tracks []reload.ProbeTrack
+	if len(plan.FrontsH3) > 0 {
+		tracks = append(tracks, reload.ProbeTrack{
+			Name:   pool.NetworkH3,
+			Fronts: deviceNames(plan.FrontsH3),
+			Exits:  deviceNames(plan.ExitsH3),
+		})
+	}
+	if len(plan.FrontsH2) > 0 {
+		tracks = append(tracks, reload.ProbeTrack{
+			Name:   pool.NetworkH2,
+			Fronts: deviceNames(plan.FrontsH2),
+			Exits:  deviceNames(plan.ExitsH2),
+		})
+	}
+	return tracks
 }
 
 func deviceNames(devices []pool.Device) []string {

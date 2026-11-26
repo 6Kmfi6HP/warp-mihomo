@@ -1,13 +1,16 @@
 package reload
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -21,11 +24,13 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	C.SetHomeDir(t.TempDir())
 	first := mustYAML(t, 0,
 		[]deviceSpec{
-			{"warp-front-1", "162.159.198.2", 443},
-			{"warp-front-2", "162.159.198.4", 500},
+			{pool.NetworkH3, "warp-front-h3-1", "162.159.198.1", 4443},
+			{pool.NetworkH3, "warp-front-h3-2", "162.159.198.2", 8443},
+			{pool.NetworkH2, "warp-front-h2-1", "162.159.198.10", 500},
 		},
 		[]deviceSpec{
-			{"warp-exit-1", "162.159.198.3", 8095},
+			{pool.NetworkH3, "warp-exit-h3-1", "162.159.198.1", 1701},
+			{pool.NetworkH2, "warp-exit-h2-1", "162.159.198.11", 8095},
 		},
 	)
 	cfg, restore, err := Prepare(first)
@@ -39,17 +44,20 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := tunnel.Proxies()[pool.PoolName]
-	beforeFrontPool := tunnel.Proxies()[pool.FrontGroupName(0)]
-	if beforeFrontPool == nil {
-		t.Fatal("missing initial front pool")
+	beforeH3Pool := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH3, 0)]
+	beforeH2Pool := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 0)]
+	if beforeH3Pool == nil || beforeH2Pool == nil {
+		t.Fatal("missing initial front pools")
 	}
 	next := mustYAML(t, 1,
 		[]deviceSpec{
-			{"warp-front-g1-1", "162.159.198.40", 8443},
-			{"warp-front-g1-2", "162.159.198.42", 1701},
+			{pool.NetworkH3, "warp-front-h3-g1-1", "162.159.198.1", 4500},
+			{pool.NetworkH3, "warp-front-h3-g1-2", "162.159.198.2", 443},
+			{pool.NetworkH2, "warp-front-h2-g1-1", "162.159.198.40", 8443},
 		},
 		[]deviceSpec{
-			{"warp-exit-g1-1", "162.159.198.41", 4500},
+			{pool.NetworkH3, "warp-exit-h3-g1-1", "162.159.198.2", 500},
+			{pool.NetworkH2, "warp-exit-h2-g1-1", "162.159.198.41", 4500},
 		},
 	)
 	cfg, restore, err = Prepare(next)
@@ -59,17 +67,29 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	if tunnel.Proxies()[pool.PoolName] != before {
 		t.Fatal("prepare replaced the live pool")
 	}
-	if tunnel.Proxies()[pool.FrontGroupName(0)] != beforeFrontPool {
-		t.Fatal("prepare replaced the old front pool")
+	if tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH3, 0)] != beforeH3Pool || tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 0)] != beforeH2Pool {
+		t.Fatal("prepare replaced the old front pools")
 	}
-	if _, ok := tunnel.Proxies()[pool.FrontGroupName(1)]; !ok {
-		t.Fatal("new front pool was not staged")
+	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH3, 1)]; !ok {
+		t.Fatal("new h3 front pool was not staged")
 	}
-	if _, ok := tunnel.Proxies()["warp-front-g1-1"]; !ok {
-		t.Fatal("new front was not staged")
+	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 1)]; !ok {
+		t.Fatal("new h2 front pool was not staged")
 	}
-	if got := tunnel.Proxies()["warp-exit-g1-1"].Addr(); got != "162.159.198.41:4500" {
+	if got := tunnel.Proxies()["warp-exit-h2-g1-1"].Addr(); got != "162.159.198.41:4500" {
 		t.Fatalf("staged exit addr %s", got)
+	}
+	// Verify staged exit proxies are wired to tunnel.Tunnel so dialer-proxy
+	// lookup succeeds instead of failing with a nil proxydialer.Tunnel.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	_, dialErr := tunnel.Proxies()["warp-exit-h3-g1-1"].DialContext(ctx, &C.Metadata{
+		NetWork: C.TCP,
+		Host:    "127.0.0.1",
+		DstPort: 1,
+	})
+	cancel()
+	if dialErr != nil && strings.Contains(dialErr.Error(), "proxydialer.Tunnel") {
+		t.Fatalf("staged exit missing tunnel wiring: %v", dialErr)
 	}
 	if err := Promote(cfg); err != nil {
 		t.Fatal(err)
@@ -78,20 +98,32 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	if tunnel.Proxies()[pool.PoolName] == before {
 		t.Fatal("promote left the old pool in place")
 	}
-	if tunnel.Proxies()["warp-exit-1"].Addr() != "162.159.198.3:8095" {
+	if tunnel.Proxies()["warp-exit-h2-1"].Addr() != "162.159.198.11:8095" {
 		t.Fatal("old exit was removed while it should stay reachable")
 	}
-	if tunnel.Proxies()[pool.FrontGroupName(0)] != beforeFrontPool {
-		t.Fatal("old front pool was removed while old exit should stay reachable")
+	if tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH3, 0)] != beforeH3Pool || tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 0)] != beforeH2Pool {
+		t.Fatal("old front pools were removed while old exits should stay reachable")
 	}
-	Drop([]string{"warp-exit-1", "warp-front-1", "warp-front-2", pool.FrontGroupName(0)})
-	if _, ok := tunnel.Proxies()[pool.FrontGroupName(0)]; ok {
-		t.Fatal("old front pool survived Drop")
+	Drop([]string{
+		"warp-exit-h3-1", "warp-exit-h2-1",
+		"warp-front-h3-1", "warp-front-h3-2", "warp-front-h2-1",
+		pool.FrontGroupName(pool.NetworkH3, 0),
+		pool.FrontGroupName(pool.NetworkH2, 0),
+	})
+	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH3, 0)]; ok {
+		t.Fatal("old h3 front pool survived Drop")
 	}
-	if _, ok := tunnel.Proxies()[pool.FrontGroupName(1)]; !ok {
-		t.Fatal("new front pool was removed by Drop")
+	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 0)]; ok {
+		t.Fatal("old h2 front pool survived Drop")
+	}
+	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH3, 1)]; !ok {
+		t.Fatal("new h3 front pool was removed by Drop")
+	}
+	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 1)]; !ok {
+		t.Fatal("new h2 front pool was removed by Drop")
 	}
 }
+
 func TestPreparePreservesRoutingMark(t *testing.T) {
 	C.SetHomeDir(t.TempDir())
 	const mark int32 = 0x2023
@@ -118,8 +150,14 @@ func TestPreparePreservesRoutingMark(t *testing.T) {
 		}
 	}()
 	cfg, restore, err := Prepare(mustYAML(t, 0,
-		[]deviceSpec{{"warp-front-1", "162.159.198.2", 443}},
-		[]deviceSpec{{"warp-exit-1", "162.159.198.3", 8443}},
+		[]deviceSpec{
+			{pool.NetworkH3, "warp-front-h3-1", "162.159.198.1", 4443},
+			{pool.NetworkH2, "warp-front-h2-1", "162.159.198.10", 443},
+		},
+		[]deviceSpec{
+			{pool.NetworkH3, "warp-exit-h3-1", "162.159.198.2", 8443},
+			{pool.NetworkH2, "warp-exit-h2-1", "162.159.198.11", 8443},
+		},
 	))
 	close(stop)
 	if restore != nil {
@@ -128,8 +166,8 @@ func TestPreparePreservesRoutingMark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Proxies[pool.PoolName] == nil || cfg.Proxies[pool.FrontGroupName(0)] == nil {
-		t.Fatal("missing pool or front pool")
+	if cfg.Proxies[pool.PoolName] == nil || cfg.Proxies[pool.FrontGroupName(pool.NetworkH3, 0)] == nil || cfg.Proxies[pool.FrontGroupName(pool.NetworkH2, 0)] == nil {
+		t.Fatal("missing pool or front pools")
 	}
 	if changed.Load() || dialer.DefaultRoutingMark.Load() != mark || !resolver.DisableIPv6 {
 		t.Fatal("prepare changed process-global dialer settings")
@@ -137,19 +175,20 @@ func TestPreparePreservesRoutingMark(t *testing.T) {
 }
 
 type deviceSpec struct {
-	name   string
-	server string
-	port   int
+	network string
+	name    string
+	server  string
+	port    int
 }
 
 func mustYAML(t *testing.T, gen int, fronts, exits []deviceSpec) []byte {
 	t.Helper()
 	devices := make([]pool.Device, 0, len(fronts)+len(exits))
 	for _, f := range fronts {
-		devices = append(devices, mustDev(t, pool.RoleFront, gen, f.name, f.server, f.port))
+		devices = append(devices, mustDev(t, pool.RoleFront, f.network, gen, f.name, f.server, f.port))
 	}
 	for _, e := range exits {
-		devices = append(devices, mustDev(t, pool.RoleExit, gen, e.name, e.server, e.port))
+		devices = append(devices, mustDev(t, pool.RoleExit, e.network, gen, e.name, e.server, e.port))
 	}
 	raw, err := pool.YAML(devices, false)
 	if err != nil {
@@ -158,7 +197,7 @@ func mustYAML(t *testing.T, gen int, fronts, exits []deviceSpec) []byte {
 	return raw
 }
 
-func mustDev(t *testing.T, role string, gen int, name, server string, port int) pool.Device {
+func mustDev(t *testing.T, role, network string, gen int, name, server string, port int) pool.Device {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -174,6 +213,7 @@ func mustDev(t *testing.T, role string, gen int, name, server string, port int) 
 	}
 	return pool.Device{
 		Role:       role,
+		Network:    network,
 		Name:       name,
 		Generation: gen,
 		PrivateKey: base64.StdEncoding.EncodeToString(sec1),

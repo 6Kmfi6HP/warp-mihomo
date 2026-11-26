@@ -11,9 +11,10 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 	return YAMLWithDirect(devices, tun, DirectRules{})
 }
 
-// YAMLWithDirect renders a mihomo config. Front devices dial MASQUE directly and
-// sit in a generation-scoped front load-balance group. Each exit sets
-// dialer-proxy to that front group, and warp-pool load-balances across exits.
+// YAMLWithDirect renders a mihomo config. Each enabled protocol track (H3 with
+// BBR and H2) gets its own direct front load-balance pool, and each exit dials
+// through the matching front pool. One unified warp-pool load-balances across
+// all H3 and H2 exits.
 // With TUN, auto-redirect mark mode captures public egress, including sockets
 // bound to a namespace address. Local destinations are excluded before DNS
 // hijack and stay on the container network. Custom direct targets bypass
@@ -21,11 +22,13 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 // marks its own dials so the fronts and DIRECT dials still leave through the
 // container NIC.
 func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, error) {
-	fronts, exits, gen, err := SplitRoles(devices)
+	plan, err := SplitPlan(devices)
 	if err != nil {
 		return nil, err
 	}
-	frontGroup := FrontGroupName(gen)
+	frontH3Group := FrontGroupName(NetworkH3, plan.Gen)
+	frontH2Group := FrontGroupName(NetworkH2, plan.Gen)
+
 	var b strings.Builder
 	b.WriteString("allow-lan: false\n")
 	b.WriteString("mode: rule\n")
@@ -70,20 +73,35 @@ func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, err
 	b.WriteString("    - 1.1.1.1\n")
 	b.WriteString("\n")
 	b.WriteString("proxies:\n")
-	for _, d := range fronts {
+	for _, d := range plan.FrontsH3 {
 		if err := writeProxy(&b, d, ""); err != nil {
 			return nil, err
 		}
 	}
-	for _, d := range exits {
-		if err := writeProxy(&b, d, frontGroup); err != nil {
+	for _, d := range plan.FrontsH2 {
+		if err := writeProxy(&b, d, ""); err != nil {
+			return nil, err
+		}
+	}
+	for _, d := range plan.ExitsH3 {
+		if err := writeProxy(&b, d, frontH3Group); err != nil {
+			return nil, err
+		}
+	}
+	for _, d := range plan.ExitsH2 {
+		if err := writeProxy(&b, d, frontH2Group); err != nil {
 			return nil, err
 		}
 	}
 	b.WriteString("\n")
 	b.WriteString("proxy-groups:\n")
-	writeLoadBalanceGroup(&b, frontGroup, false, fronts)
-	writeLoadBalanceGroup(&b, PoolName, true, exits)
+	if len(plan.FrontsH3) > 0 {
+		writeLoadBalanceGroup(&b, frontH3Group, false, plan.FrontsH3)
+	}
+	if len(plan.FrontsH2) > 0 {
+		writeLoadBalanceGroup(&b, frontH2Group, false, plan.FrontsH2)
+	}
+	writeLoadBalanceGroup(&b, PoolName, true, plan.Exits())
 	b.WriteString("\n")
 	if tun || len(direct.Domains) > 0 {
 		b.WriteString("rule-providers:\n")
@@ -154,6 +172,7 @@ func writeProxy(b *strings.Builder, d Device, dialer string) error {
 	if dialer != "" && d.Role != RoleExit {
 		return fmt.Errorf("device %s cannot dial through the front", d.Name)
 	}
+	net := deviceNetwork(d)
 	fmt.Fprintf(b, "  - name: %s\n", d.Name)
 	b.WriteString("    type: masque\n")
 	fmt.Fprintf(b, "    server: %s\n", strconv.Quote(d.Server))
@@ -164,7 +183,16 @@ func writeProxy(b *strings.Builder, d Device, dialer string) error {
 	fmt.Fprintf(b, "    ipv6: %s\n", strconv.Quote(d.IPv6))
 	b.WriteString("    mtu: 1280\n")
 	b.WriteString("    udp: true\n")
-	b.WriteString("    network: h2\n")
+	switch net {
+	case NetworkH3:
+		// Omit network so mihomo uses default QUIC/HTTP3 CONNECT-IP with BBR.
+		b.WriteString("    congestion-controller: bbr\n")
+		b.WriteString("    bbr-profile: standard\n")
+	case NetworkH2:
+		b.WriteString("    network: h2\n")
+	default:
+		return fmt.Errorf("device %s has unsupported network %q", d.Name, net)
+	}
 	b.WriteString("    sni: consumer-masque.cloudflareclient.com\n")
 	b.WriteString("    remote-dns-resolve: true\n")
 	if dialer != "" {

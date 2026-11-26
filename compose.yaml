@@ -11,9 +11,12 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
-      WARP_FRONTS: "1"
-      WARP_EXITS: "3"
+      WARP_FRONTS_H3: "2"
+      WARP_EXITS_H3: "3"
+      WARP_FRONTS_H2: "1"
+      WARP_EXITS_H2: "1"
       WARP_ROTATE: ${WARP_ROTATE:-1h}
+      WARP_FALLBACK_REG_URL: ${WARP_FALLBACK_REG_URL:-}
       SKIP_SYSTEM_IPV6_CHECK: "1"
     dns:
       - 1.1.1.1
