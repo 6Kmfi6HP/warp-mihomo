@@ -34,27 +34,34 @@ func TestEnsureFillsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := Ensure(dir, 2, reg)
+	got, err := Ensure(dir, 2, 3, reg)
 	unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 3 {
-		t.Fatalf("enroll calls %d, want 3", calls)
+	if calls != 5 {
+		t.Fatalf("enroll calls %d, want 5", calls)
 	}
-	if got[0].Role != RoleFront || got[0].Name != FrontName {
-		t.Fatalf("front %+v", got[0])
+	if got[0].Role != RoleFront || got[0].Name != "warp-front-1" || got[1].Role != RoleFront || got[1].Name != "warp-front-2" {
+		t.Fatalf("fronts %+v", got[:2])
 	}
-	if got[1].Name != "warp-exit-1" || got[2].Name != "warp-exit-2" {
-		t.Fatalf("exits %+v", got[1:])
+	if got[2].Name != "warp-exit-1" || got[3].Name != "warp-exit-2" || got[4].Name != "warp-exit-3" {
+		t.Fatalf("exits %+v", got[2:])
 	}
-	seen := map[string]bool{}
+	seenCreds := map[string]bool{}
+	seenServers := map[string]bool{}
 	seenPorts := map[int]bool{}
 	for _, d := range got {
-		if seen[d.Server] {
+		if seenCreds[d.PrivateKey] || seenCreds[d.PublicKey] || seenCreds[d.IPv6] {
+			t.Fatalf("duplicate credential in %+v", d)
+		}
+		seenCreds[d.PrivateKey] = true
+		seenCreds[d.PublicKey] = true
+		seenCreds[d.IPv6] = true
+		if seenServers[d.Server] {
 			t.Fatalf("duplicate server %s", d.Server)
 		}
-		seen[d.Server] = true
+		seenServers[d.Server] = true
 		if !slices.Contains(masquePorts, d.Port) {
 			t.Fatalf("unsupported port %d", d.Port)
 		}
@@ -68,15 +75,15 @@ func TestEnsureFillsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := Ensure(dir, 2, reg)
+	again, err := Ensure(dir, 2, 3, reg)
 	unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 3 {
+	if calls != 5 {
 		t.Fatalf("second ensure enrolled again, calls %d", calls)
 	}
-	if again[0].Server != got[0].Server || again[1].PrivateKey != got[1].PrivateKey {
+	if again[0].Server != got[0].Server || again[2].PrivateKey != got[2].PrivateKey {
 		t.Fatal("stored identities changed")
 	}
 
@@ -84,16 +91,72 @@ func TestEnsureFillsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	grown, err := Ensure(dir, 3, reg)
+	grown, err := Ensure(dir, 3, 4, reg)
 	unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 4 || len(grown) != 4 || grown[3].Name != "warp-exit-3" {
-		t.Fatalf("grow calls %d devices %+v", calls, grown)
+	if calls != 7 || len(grown) != 7 {
+		t.Fatalf("grow calls %d len %d devices %+v", calls, len(grown), grown)
 	}
-	if grown[3].Port == got[0].Port || grown[3].Port == got[1].Port || grown[3].Port == got[2].Port {
-		t.Fatalf("grown exit reused port %d in %+v", grown[3].Port, grown)
+	if grown[2].Name != "warp-front-3" || grown[6].Name != "warp-exit-4" {
+		t.Fatalf("grown names %+v", grown)
+	}
+	grownServers := map[string]bool{}
+	grownPorts := map[int]bool{}
+	for _, d := range grown {
+		if grownServers[d.Server] {
+			t.Fatalf("duplicate server after grow %s", d.Server)
+		}
+		grownServers[d.Server] = true
+		if grownPorts[d.Port] {
+			t.Fatalf("duplicate port %d after grow in %+v", d.Port, grown)
+		}
+		grownPorts[d.Port] = true
+	}
+}
+
+func TestEnsureLegacyFrontCompatibilityAndNumericSort(t *testing.T) {
+	dir := t.TempDir()
+	legacy := fileState{
+		Devices: []Device{
+			{
+				Role:       RoleFront,
+				Name:       FrontName,
+				PrivateKey: "priv-legacy",
+				PublicKey:  "pub-legacy",
+				IP:         "172.16.0.2",
+				IPv6:       "2606:4700:110::legacy",
+				Server:     "162.159.198.2",
+				Port:       443,
+			},
+		},
+	}
+	if err := save(dir, legacy); err != nil {
+		t.Fatal(err)
+	}
+	reg := func(name string) (warp.Identity, error) {
+		return warp.Identity{
+			PrivateKey: "priv-" + name,
+			PublicKey:  "pub-" + name,
+			IP:         "172.16.0.2",
+			IPv6:       "2606:4700:110::" + name,
+		}, nil
+	}
+	unlock, err := Lock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	devs, err := Ensure(dir, 2, 10, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if devs[0].Name != FrontName || devs[1].Name != "warp-front-2" {
+		t.Fatalf("fronts %+v", devs[:2])
+	}
+	if devs[2].Name != "warp-exit-1" || devs[11].Name != "warp-exit-10" {
+		t.Fatalf("exit numeric order broken: %+v", devs[2:])
 	}
 }
 
@@ -113,8 +176,8 @@ func TestDistinctPortsAndOverflowBalance(t *testing.T) {
 	}
 	defer unlock()
 
-	// 1 front + 6 exits = 7 devices: every node gets a unique supported port.
-	devs, err := Ensure(dir, 6, reg)
+	// 2 fronts + 5 exits = 7 devices: every node gets a unique supported port.
+	devs, err := Ensure(dir, 2, 5, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +193,7 @@ func TestDistinctPortsAndOverflowBalance(t *testing.T) {
 	}
 
 	// Growing past len(masquePorts) stays balanced instead of failing.
-	more, err := Ensure(dir, 8, reg)
+	more, err := Ensure(dir, 3, 7, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +217,7 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 			PrivateKey: "priv-" + name,
 			PublicKey:  "pub-" + name,
 			IP:         "172.16.0.2",
-			IPv6:       "2606:4700:110::1",
+			IPv6:       "2606:4700:110::" + name,
 		}, nil
 	}
 	unlock, err := Lock(dir)
@@ -162,32 +225,47 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	first, err := Ensure(dir, 1, reg)
+	first, err := Ensure(dir, 2, 2, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, err := Rotate(dir, 1, reg)
+	next, err := Rotate(dir, 2, 2, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 4 {
-		t.Fatalf("calls %d", calls)
+	if calls != 8 {
+		t.Fatalf("calls %d, want 8", calls)
 	}
-	if next[0].Name != "warp-front-g1" || next[1].Name != "warp-exit-g1-1" {
+	if next[0].Name != "warp-front-g1-1" || next[1].Name != "warp-front-g1-2" || next[2].Name != "warp-exit-g1-1" || next[3].Name != "warp-exit-g1-2" {
 		t.Fatalf("next %+v", next)
 	}
-	if next[0].Server == first[0].Server || next[1].Server == first[1].Server {
-		t.Fatalf("address was not rotated: %s %s", next[0].Server, next[1].Server)
+	usedServers := map[string]bool{}
+	usedCreds := map[string]bool{}
+	for _, d := range first {
+		usedServers[d.Server] = true
+		usedCreds[d.PrivateKey] = true
 	}
-	rotatedPorts := map[int]bool{first[0].Port: true, first[1].Port: true}
 	for _, d := range next {
+		if usedServers[d.Server] {
+			t.Fatalf("server %s was reused across generations", d.Server)
+		}
+		usedServers[d.Server] = true
+		if usedCreds[d.PrivateKey] {
+			t.Fatalf("credential %s was reused across generations", d.PrivateKey)
+		}
+		usedCreds[d.PrivateKey] = true
+	}
+	portCounts := map[int]int{}
+	for _, d := range append(slices.Clone(first), next...) {
 		if !slices.Contains(masquePorts, d.Port) {
-			t.Fatalf("rotated device %s got unsupported port %d", d.Name, d.Port)
+			t.Fatalf("device %s got unsupported port %d", d.Name, d.Port)
 		}
-		if rotatedPorts[d.Port] {
-			t.Fatalf("rotated device %s reused port %d across generations", d.Name, d.Port)
+		portCounts[d.Port]++
+	}
+	for _, p := range masquePorts {
+		if portCounts[p] < 1 || portCounts[p] > 2 {
+			t.Fatalf("unbalanced port %d count %d across generations", p, portCounts[p])
 		}
-		rotatedPorts[d.Port] = true
 	}
 	pending, err := load(dir)
 	if err != nil {
@@ -196,28 +274,28 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 	if activeGeneration(pending) != first[0].Generation {
 		t.Fatalf("unprobed generation %d became active", activeGeneration(pending))
 	}
-	recovered, err := Ensure(dir, 1, reg)
+	recovered, err := Ensure(dir, 2, 2, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered[0].Name != first[0].Name || calls != 4 {
+	if recovered[0].Name != first[0].Name || calls != 8 {
 		t.Fatalf("restart kept the unprobed generation: %+v calls %d", recovered, calls)
 	}
-	next, err = Rotate(dir, 1, reg)
+	next, err = Rotate(dir, 2, 2, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 6 {
-		t.Fatalf("calls %d", calls)
+	if calls != 12 {
+		t.Fatalf("calls %d, want 12", calls)
 	}
 	if err := Activate(dir, next[0].Generation); err != nil {
 		t.Fatal(err)
 	}
-	again, err := Ensure(dir, 1, reg)
+	again, err := Ensure(dir, 2, 2, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again[0].Name != next[0].Name || calls != 6 {
+	if again[0].Name != next[0].Name || calls != 12 {
 		t.Fatalf("ensure re-enrolled after activate: %+v calls %d", again, calls)
 	}
 	state, err := load(dir)
@@ -229,11 +307,11 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 			t.Fatalf("inactive generation survived restart: %+v", dev)
 		}
 	}
-	exits := []string{first[1].Name}
-	if !GenerationIdle(exits, [][]string{{first[0].Name}}) {
+	exits := []string{first[2].Name, first[3].Name}
+	if !GenerationIdle(exits, [][]string{{FrontGroupName(0), first[0].Name}}) {
 		t.Fatal("front transport blocked retirement")
 	}
-	if GenerationIdle(exits, [][]string{{"warp-pool", first[1].Name}}) {
+	if GenerationIdle(exits, [][]string{{PoolName, first[2].Name}}) {
 		t.Fatal("live exit was treated as idle")
 	}
 }
@@ -251,9 +329,12 @@ func TestEnsureRejectsSecondLock(t *testing.T) {
 }
 
 func TestYAMLParsesAsMihomo(t *testing.T) {
-	devices := []Device{mustDevice(t, RoleFront, FrontName)}
-	for _, name := range []string{"warp-exit-1", "warp-exit-2"} {
-		devices = append(devices, mustDevice(t, RoleExit, name))
+	devices := []Device{
+		mustDevice(t, RoleFront, "warp-front-1"),
+		mustDevice(t, RoleFront, "warp-front-2"),
+		mustDevice(t, RoleExit, "warp-exit-1"),
+		mustDevice(t, RoleExit, "warp-exit-2"),
+		mustDevice(t, RoleExit, "warp-exit-3"),
 	}
 	raw, err := YAML(devices, true)
 	if err != nil {
@@ -295,15 +376,30 @@ func TestYAMLParsesAsMihomo(t *testing.T) {
 	if len(cfg.DNS.NameServer) != 1 || cfg.DNS.NameServer[0].ProxyName != PoolName {
 		t.Fatalf("nameserver %+v", cfg.DNS.NameServer)
 	}
-	front := cfg.Proxies[FrontName].ProxyInfo()
-	if front.DialerProxy != "" {
-		t.Fatalf("front dialer %q", front.DialerProxy)
-	}
-	for _, name := range []string{"warp-exit-1", "warp-exit-2"} {
-		info := cfg.Proxies[name].ProxyInfo()
-		if info.DialerProxy != FrontName {
-			t.Fatalf("%s dialer %q", name, info.DialerProxy)
+	for _, name := range []string{"warp-front-1", "warp-front-2"} {
+		front := cfg.Proxies[name].ProxyInfo()
+		if front.DialerProxy != "" {
+			t.Fatalf("%s dialer %q", name, front.DialerProxy)
 		}
+	}
+	frontGroupName := FrontGroupName(0)
+	for _, name := range []string{"warp-exit-1", "warp-exit-2", "warp-exit-3"} {
+		info := cfg.Proxies[name].ProxyInfo()
+		if info.DialerProxy != frontGroupName {
+			t.Fatalf("%s dialer %q, want %q", name, info.DialerProxy, frontGroupName)
+		}
+	}
+	frontGroup, ok := cfg.Proxies[frontGroupName]
+	if !ok {
+		t.Fatal("missing front pool group")
+	}
+	frontEncoded, err := frontGroup.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontText := string(frontEncoded)
+	if !strings.Contains(frontText, "warp-front-1") || !strings.Contains(frontText, "warp-front-2") || strings.Contains(frontText, "warp-exit-1") {
+		t.Fatalf("front group %s", frontText)
 	}
 	group, ok := cfg.Proxies[PoolName]
 	if !ok {
@@ -314,7 +410,7 @@ func TestYAMLParsesAsMihomo(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(encoded)
-	if !strings.Contains(text, "warp-exit-1") || !strings.Contains(text, "warp-exit-2") || strings.Contains(text, FrontName) {
+	if !strings.Contains(text, "warp-exit-1") || !strings.Contains(text, "warp-exit-2") || !strings.Contains(text, "warp-exit-3") || strings.Contains(text, "warp-front") {
 		t.Fatalf("group %s", text)
 	}
 }

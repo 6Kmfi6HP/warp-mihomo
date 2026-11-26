@@ -1,6 +1,6 @@
-// Package pool stores WARP identities and renders a one-hop mihomo config:
-// one direct front, N masque exits that dial through it, and a TUN that
-// takes the network namespace.
+// Package pool stores WARP identities and renders a two-tier mihomo config:
+// a front load-balance pool of direct MASQUE devices, N exit MASQUE devices
+// dialing through that front pool, and a TUN that takes the network namespace.
 package pool
 
 import (
@@ -24,11 +24,14 @@ const (
 	RoleFront = "front"
 	RoleExit  = "exit"
 
-	FrontName = "warp-front"
-	PoolName  = "warp-pool"
+	FrontName     = "warp-front"
+	FrontPoolName = "warp-front-pool"
+	PoolName      = "warp-pool"
 
-	minExits = 1
-	maxExits = 16
+	minFronts = 1
+	maxFronts = 16
+	minExits  = 1
+	maxExits  = 16
 )
 
 // masquePorts are the TCP/UDP ports Cloudflare WARP MASQUE endpoints listen on.
@@ -76,13 +79,13 @@ func Lock(dir string) (func(), error) {
 }
 
 // Ensure loads identities from dir and enrolls only the deficit.
-// exits is the number of devices behind the front, not counting the front.
+// fronts and exits specify the device counts for the front and exit pools.
 // Generations other than the active one are removed: a restart has no live
 // sessions, and an uncommitted rotation must not keep its addresses.
 // The directory lock must already be held.
-func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
-	if exits < minExits || exits > maxExits {
-		return nil, fmt.Errorf("exits must be %d-%d, got %d", minExits, maxExits, exits)
+func Ensure(dir string, fronts, exits int, reg Registrar) ([]Device, error) {
+	if err := validateCounts(fronts, exits); err != nil {
+		return nil, err
 	}
 	state, err := load(dir)
 	if err != nil {
@@ -108,46 +111,21 @@ func Ensure(dir string, exits int, reg Registrar) ([]Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !hasGenerationRole(state.Devices, gen, RoleFront) {
-		id, err := reg(frontName(gen))
-		if err != nil {
-			return nil, fmt.Errorf("enroll front: %w", err)
-		}
-		dev, err := newDevice(RoleFront, frontName(gen), gen, id, endpoints)
-		if err != nil {
-			return nil, err
-		}
-		state.Devices = append(state.Devices, dev)
-		if err := save(dir, state); err != nil {
-			return nil, err
-		}
+	if err := enrollRoleDeficit(dir, &state, gen, RoleFront, fronts, endpoints, reg); err != nil {
+		return nil, err
 	}
-	have := countGenerationRole(state.Devices, gen, RoleExit)
-	for have < exits {
-		name := nextExitName(state.Devices, gen)
-		id, err := reg(name)
-		if err != nil {
-			return nil, fmt.Errorf("enroll %s: %w", name, err)
-		}
-		dev, err := newDevice(RoleExit, name, gen, id, endpoints)
-		if err != nil {
-			return nil, err
-		}
-		state.Devices = append(state.Devices, dev)
-		if err := save(dir, state); err != nil {
-			return nil, err
-		}
-		have++
+	if err := enrollRoleDeficit(dir, &state, gen, RoleExit, exits, endpoints, reg); err != nil {
+		return nil, err
 	}
-	return selectGeneration(state.Devices, gen, exits)
+	return selectGeneration(state.Devices, gen, fronts, exits)
 }
 
 // Rotate enrolls a new generation on fresh endpoint addresses without making it
 // active. The caller activates it only after the generation dials successfully.
 // The previous generation stays in the file so its live sessions can finish.
-func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
-	if exits < minExits || exits > maxExits {
-		return nil, fmt.Errorf("exits must be %d-%d, got %d", minExits, maxExits, exits)
+func Rotate(dir string, fronts, exits int, reg Registrar) ([]Device, error) {
+	if err := validateCounts(fronts, exits); err != nil {
+		return nil, err
 	}
 	state, err := load(dir)
 	if err != nil {
@@ -158,17 +136,20 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	id, err := reg(frontName(gen))
-	if err != nil {
-		return nil, fmt.Errorf("enroll front: %w", err)
+	for range fronts {
+		name := nextRoleName(state.Devices, gen, RoleFront)
+		id, err := reg(name)
+		if err != nil {
+			return nil, fmt.Errorf("enroll %s: %w", name, err)
+		}
+		dev, err := newDevice(RoleFront, name, gen, id, endpoints)
+		if err != nil {
+			return nil, err
+		}
+		state.Devices = append(state.Devices, dev)
 	}
-	front, err := newDevice(RoleFront, frontName(gen), gen, id, endpoints)
-	if err != nil {
-		return nil, err
-	}
-	state.Devices = append(state.Devices, front)
 	for range exits {
-		name := nextExitName(state.Devices, gen)
+		name := nextRoleName(state.Devices, gen, RoleExit)
 		id, err := reg(name)
 		if err != nil {
 			return nil, fmt.Errorf("enroll %s: %w", name, err)
@@ -182,7 +163,38 @@ func Rotate(dir string, exits int, reg Registrar) ([]Device, error) {
 	if err := save(dir, state); err != nil {
 		return nil, err
 	}
-	return selectGeneration(state.Devices, gen, exits)
+	return selectGeneration(state.Devices, gen, fronts, exits)
+}
+
+func validateCounts(fronts, exits int) error {
+	if fronts < minFronts || fronts > maxFronts {
+		return fmt.Errorf("fronts must be %d-%d, got %d", minFronts, maxFronts, fronts)
+	}
+	if exits < minExits || exits > maxExits {
+		return fmt.Errorf("exits must be %d-%d, got %d", minExits, maxExits, exits)
+	}
+	return nil
+}
+
+func enrollRoleDeficit(dir string, state *fileState, gen int, role string, want int, endpoints *endpointPool, reg Registrar) error {
+	have := countGenerationRole(state.Devices, gen, role)
+	for have < want {
+		name := nextRoleName(state.Devices, gen, role)
+		id, err := reg(name)
+		if err != nil {
+			return fmt.Errorf("enroll %s: %w", name, err)
+		}
+		dev, err := newDevice(role, name, gen, id, endpoints)
+		if err != nil {
+			return err
+		}
+		state.Devices = append(state.Devices, dev)
+		if err := save(dir, *state); err != nil {
+			return err
+		}
+		have++
+	}
+	return nil
 }
 
 type endpointPool struct {
@@ -315,22 +327,27 @@ func maxGeneration(devices []Device) int {
 	return max
 }
 
-func frontName(gen int) string {
+// FrontGroupName returns the generation-scoped front load-balance group name.
+func FrontGroupName(gen int) string {
+	if gen == 0 {
+		return FrontPoolName
+	}
+	return fmt.Sprintf("%s-g%d", FrontPoolName, gen)
+}
+
+func rolePrefix(role string, gen int) string {
+	base := "warp-" + role
+	if gen == 0 {
+		return base + "-"
+	}
+	return fmt.Sprintf("%s-g%d-", base, gen)
+}
+
+func legacyFrontName(gen int) string {
 	if gen == 0 {
 		return FrontName
 	}
 	return fmt.Sprintf("warp-front-g%d", gen)
-}
-
-func exitPrefix(gen int) string {
-	if gen == 0 {
-		return "warp-exit-"
-	}
-	return fmt.Sprintf("warp-exit-g%d-", gen)
-}
-
-func hasGenerationRole(devices []Device, gen int, role string) bool {
-	return countGenerationRole(devices, gen, role) > 0
 }
 
 func countGenerationRole(devices []Device, gen int, role string) int {
@@ -343,54 +360,107 @@ func countGenerationRole(devices []Device, gen int, role string) int {
 	return n
 }
 
-func nextExitName(devices []Device, gen int) string {
-	prefix := exitPrefix(gen)
+func nextRoleName(devices []Device, gen int, role string) string {
+	prefix := rolePrefix(role, gen)
+	legacy := ""
+	if role == RoleFront {
+		legacy = legacyFrontName(gen)
+	}
 	max := 0
 	for _, d := range devices {
-		if d.Generation != gen || d.Role != RoleExit || !strings.HasPrefix(d.Name, prefix) {
+		if d.Generation != gen || d.Role != role {
 			continue
 		}
-		n, err := strconv.Atoi(strings.TrimPrefix(d.Name, prefix))
-		if err != nil {
+		if legacy != "" && d.Name == legacy && max < 1 {
+			max = 1
 			continue
 		}
-		if n > max {
+		n, ok := deviceIndex(d.Name, prefix)
+		if ok && n > max {
 			max = n
 		}
 	}
 	return prefix + strconv.Itoa(max+1)
 }
 
-func selectGeneration(devices []Device, gen, exits int) ([]Device, error) {
-	var front *Device
-	var out []Device
+func deviceIndex(name, prefix string) (int, bool) {
+	if !strings.HasPrefix(name, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(name, prefix))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func sortRoleDevices(devs []Device, prefix string) {
+	sort.Slice(devs, func(i, j int) bool {
+		ni, oki := deviceIndex(devs[i].Name, prefix)
+		nj, okj := deviceIndex(devs[j].Name, prefix)
+		if oki && okj && ni != nj {
+			return ni < nj
+		}
+		return devs[i].Name < devs[j].Name
+	})
+}
+
+// SplitRoles separates a generation's devices into fronts and exits and verifies
+// they share a single generation with at least one front and one exit.
+func SplitRoles(devices []Device) (fronts, exits []Device, gen int, err error) {
+	if len(devices) < 2 {
+		return nil, nil, 0, fmt.Errorf("yaml wants at least one front and one exit")
+	}
+	gen = devices[0].Generation
+	for _, d := range devices {
+		if d.Generation != gen {
+			return nil, nil, 0, fmt.Errorf("device %s generation %d does not match %d", d.Name, d.Generation, gen)
+		}
+		switch d.Role {
+		case RoleFront:
+			fronts = append(fronts, d)
+		case RoleExit:
+			exits = append(exits, d)
+		default:
+			return nil, nil, 0, fmt.Errorf("device %s has unknown role %q", d.Name, d.Role)
+		}
+	}
+	if len(fronts) == 0 {
+		return nil, nil, 0, fmt.Errorf("generation %d has no front", gen)
+	}
+	if len(exits) == 0 {
+		return nil, nil, 0, fmt.Errorf("generation %d has no exit", gen)
+	}
+	return fronts, exits, gen, nil
+}
+
+func selectGeneration(devices []Device, gen, wantFronts, wantExits int) ([]Device, error) {
+	var fronts []Device
+	var exits []Device
 	for _, d := range devices {
 		if d.Generation != gen {
 			continue
 		}
 		switch d.Role {
 		case RoleFront:
-			if front != nil {
-				return nil, fmt.Errorf("generation %d has more than one front", gen)
-			}
-			cp := d
-			front = &cp
+			fronts = append(fronts, d)
 		case RoleExit:
-			out = append(out, d)
+			exits = append(exits, d)
 		default:
 			return nil, fmt.Errorf("device %s has unknown role %q", d.Name, d.Role)
 		}
 	}
-	if front == nil {
-		return nil, fmt.Errorf("generation %d has no front", gen)
+	sortRoleDevices(fronts, rolePrefix(RoleFront, gen))
+	sortRoleDevices(exits, rolePrefix(RoleExit, gen))
+	if len(fronts) < wantFronts {
+		return nil, fmt.Errorf("generation %d has %d fronts, want %d", gen, len(fronts), wantFronts)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	if len(out) < exits {
-		return nil, fmt.Errorf("generation %d has %d exits, want %d", gen, len(out), exits)
+	if len(exits) < wantExits {
+		return nil, fmt.Errorf("generation %d has %d exits, want %d", gen, len(exits), wantExits)
 	}
-	selected := make([]Device, 0, 1+exits)
-	selected = append(selected, *front)
-	selected = append(selected, out[:exits]...)
+	selected := make([]Device, 0, wantFronts+wantExits)
+	selected = append(selected, fronts[:wantFronts]...)
+	selected = append(selected, exits[:wantExits]...)
 	return selected, nil
 }
 

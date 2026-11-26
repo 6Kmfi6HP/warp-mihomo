@@ -165,7 +165,7 @@ rules:
 	}
 
 	devices := []Device{
-		mustDevice(t, RoleFront, FrontName),
+		mustDevice(t, RoleFront, "warp-front-1"),
 		mustDevice(t, RoleExit, "warp-exit-1"),
 	}
 	for _, tun := range []bool{true, false} {

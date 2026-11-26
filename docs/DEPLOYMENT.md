@@ -9,10 +9,10 @@
 1. **网络共享**：业务容器通过 `network_mode: "service:warp-mihomo"` 共享 `warp-mihomo` 的网络命名空间。
 2. **透明劫持**：mihomo 启用 `tun`（`stack: mips`、`auto-route: true`、`auto-redirect: true`），在 Linux 下使用 mark 模式接管容器内的公网出站流量及端口 53 的 DNS 请求（`dns-hijack`）。
 3. **直连绕行**：容器内网及保留地址段（`0.0.0.0/8`、`10.0.0.0/8`、`100.64.0.0/10`、`127.0.0.0/8`、`169.254.0.0/16`、`172.16.0.0/12`、`192.168.0.0/16`、`198.18.0.0/15`、`224.0.0.0/4`、`::/127`、`fc00::/7`、`fe80::/10`）保持直连，不进入 WARP。
-4. **单跳池化与轮换**：
-   - 池由 1 个直连的 MASQUE 前置节点（`warp-front`）和 N 个出口节点（`warp-exit-*`，通过 `dialer-proxy: warp-front` 建连）组成，`warp-pool` 以 `round-robin` 策略在各出口间轮询。
+4. **双层池化与轮换**：
+   - 池由 M 个直连的 MASQUE 前置节点（组成前置负载均衡组 `warp-front-pool`，轮换代为 `warp-front-pool-g<N>`）和 N 个出口节点（`warp-exit-*`，通过 `dialer-proxy` 经前置负载均衡组建连）组成，后置 `warp-pool` 以 `round-robin` 策略在各出口间轮询。
    - 目标服务器看到的是出口节点的 IP，而非前置节点 IP；同一接入点下 IPv4 仍可能碰撞，IPv6 按设备独立分配。
-   - 当启用 `WARP_ROTATE` 时，后台会定期注册新一代节点、探测至少一个新出口连通后原子切换 `warp-pool`。TUN 不会被重建，既有连接继续在旧代会话上自然排空，全部空闲后再清理旧代设备。
+   - 当启用 `WARP_ROTATE` 时，后台会定期注册新一代前置与出口节点、验证全部新前置及至少一个新出口连通后原子切换 `warp-pool`。TUN 不会被重建，既有连接继续在旧代会话上自然排空，全部空闲后再清理旧代设备及旧代前置组。
 
 ---
 
@@ -38,6 +38,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
+      WARP_FRONTS: "1"
       WARP_EXITS: "3"
       WARP_ROTATE: "1h"
       SKIP_SYSTEM_IPV6_CHECK: "1"
@@ -93,7 +94,8 @@ docker compose up -d
 | 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
 | `WARP_DATA` | `/data`（容器内） / `data`（本地） | 状态与配置文件目录 |
-| `WARP_EXITS` | `3` | 出口设备数量，合法范围 `1`–`16`（前置节点额外计 1 个） |
+| `WARP_FRONTS` | `1` | 前置设备数量，合法范围 `1`–`16`（进入 `warp-front-pool` 负载均衡组） |
+| `WARP_EXITS` | `3` | 出口设备数量，合法范围 `1`–`16`（进入 `warp-pool` 负载均衡组） |
 | `WARP_ROTATE` | `1h` | 自动轮换间隔（Go duration 格式，如 `30m`、`2h`）；设为 `0` 关闭轮换 |
 | `WARP_TUN` | `true` | 是否启用 TUN；设为 `0`、`false` 或 `no` 可关闭 |
 | `WARP_DIRECT` | 空 | 逗号分隔的直连绕过列表（支持域名、`.后缀`/`*.后缀`、IP/CIDR），命中后走 `DIRECT` |

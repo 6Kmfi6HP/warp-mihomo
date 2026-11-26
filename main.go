@@ -54,41 +54,48 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: warp-mihomo run|enroll|health [-data dir] [-exits n] [-tun]")
+	fmt.Fprintln(os.Stderr, "usage: warp-mihomo run|enroll|health [-data dir] [-fronts n] [-exits n] [-tun]")
 	fmt.Fprintln(os.Stderr, "       warp-mihomo version")
 }
 
+type runOptions struct {
+	data   string
+	fronts int
+	exits  int
+	tun    bool
+}
+
 func run(args []string) error {
-	data, exits, tun, err := flags("run", args)
+	opts, err := flags("run", args)
 	if err != nil {
 		return err
 	}
 	if os.Getenv("SKIP_SYSTEM_IPV6_CHECK") == "" {
 		os.Setenv("SKIP_SYSTEM_IPV6_CHECK", "1")
 	}
-	direct, err := pool.LoadDirect(data, os.Getenv("WARP_DIRECT"), os.Getenv("WARP_DIRECT_FILE"))
+	direct, err := pool.LoadDirect(opts.data, os.Getenv("WARP_DIRECT"), os.Getenv("WARP_DIRECT_FILE"))
 	if err != nil {
 		return err
 	}
-	unlock, err := pool.Lock(data)
+	unlock, err := pool.Lock(opts.data)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	devices, err := pool.Ensure(data, exits, enrollOne)
+	devices, err := pool.Ensure(opts.data, opts.fronts, opts.exits, enrollOne)
 	if err != nil {
 		return err
 	}
-	raw, err := pool.YAMLWithDirect(devices, tun, direct)
+	raw, err := pool.YAMLWithDirect(devices, opts.tun, direct)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(data, "mihomo.yaml")
+	path := filepath.Join(opts.data, "mihomo.yaml")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		return err
 	}
-	C.SetHomeDir(data)
-	fmt.Fprintf(os.Stderr, "mihomo %s devices %d tun %t\n", C.Version, len(devices), tun)
+	C.SetHomeDir(opts.data)
+	fmt.Fprintf(os.Stderr, "mihomo %s devices %d (fronts %d, exits %d) tun %t\n", C.Version, len(devices), opts.fronts, opts.exits, opts.tun)
 	if len(direct.Domains) > 0 || len(direct.CIDRs) > 0 || len(direct.Rules) > 0 {
 		fmt.Fprintf(os.Stderr, "direct bypass: %d domains, %d cidrs, %d rules\n", len(direct.Domains), len(direct.CIDRs), len(direct.Rules))
 	}
@@ -103,7 +110,7 @@ func run(args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if interval > 0 {
-		go rotateLoop(ctx, data, exits, tun, interval, devices, direct)
+		go rotateLoop(ctx, opts, interval, devices, direct)
 	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -112,16 +119,16 @@ func run(args []string) error {
 }
 
 func enroll(args []string) error {
-	data, exits, _, err := flags("enroll", args)
+	opts, err := flags("enroll", args)
 	if err != nil {
 		return err
 	}
-	unlock, err := pool.Lock(data)
+	unlock, err := pool.Lock(opts.data)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	devices, err := pool.Ensure(data, exits, enrollOne)
+	devices, err := pool.Ensure(opts.data, opts.fronts, opts.exits, enrollOne)
 	if err != nil {
 		return err
 	}
@@ -142,16 +149,22 @@ func enrollOne(name string) (warp.Identity, error) {
 	return warp.Register(context.Background(), name)
 }
 
-func flags(name string, args []string) (string, int, bool, error) {
+func flags(name string, args []string) (runOptions, error) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	data := fs.String("data", getenv("WARP_DATA", "data"), "state directory")
-	exits := fs.Int("exits", getenvInt("WARP_EXITS", 3), "exit devices behind the front")
+	fronts := fs.Int("fronts", getenvInt("WARP_FRONTS", 1), "front devices in the front pool")
+	exits := fs.Int("exits", getenvInt("WARP_EXITS", 3), "exit devices in the exit pool")
 	tun := fs.Bool("tun", getenvBool("WARP_TUN", true), "enable TUN")
 	if err := fs.Parse(args); err != nil {
-		return "", 0, false, err
+		return runOptions{}, err
 	}
-	return *data, *exits, *tun, nil
+	return runOptions{
+		data:   *data,
+		fronts: *fronts,
+		exits:  *exits,
+		tun:    *tun,
+	}, nil
 }
 
 func getenv(key, fallback string) string {
@@ -208,7 +221,7 @@ func rotateEvery() (time.Duration, error) {
 	}
 }
 
-func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval time.Duration, current []pool.Device, direct pool.DirectRules) {
+func rotateLoop(ctx context.Context, opts runOptions, interval time.Duration, current []pool.Device, direct pool.DirectRules) {
 	tick := time.NewTicker(interval)
 	reap := time.NewTicker(15 * time.Second)
 	defer tick.Stop()
@@ -220,7 +233,7 @@ func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval 
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			next, hold, err := rotateOnce(data, exits, tun, current, direct)
+			next, hold, err := rotateOnce(opts, current, direct)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "rotate: %v\n", err)
 				continue
@@ -230,55 +243,68 @@ func rotateLoop(ctx context.Context, data string, exits int, tun bool, interval 
 				retired = append(retired, *hold)
 			}
 		case <-reap.C:
-			retired = reapRetired(data, retired)
+			retired = reapRetired(opts.data, retired)
 		}
 	}
 }
 
-func rotateOnce(data string, exits int, tun bool, current []pool.Device, direct pool.DirectRules) ([]pool.Device, *retiredGen, error) {
-	next, err := pool.Rotate(data, exits, enrollOne)
+func rotateOnce(opts runOptions, current []pool.Device, direct pool.DirectRules) ([]pool.Device, *retiredGen, error) {
+	next, err := pool.Rotate(opts.data, opts.fronts, opts.exits, enrollOne)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw, err := pool.YAMLWithDirect(next, tun, direct)
+	raw, err := pool.YAMLWithDirect(next, opts.tun, direct)
 	if err != nil {
-		return nil, nil, rollback(data, current, next, err)
+		return nil, nil, rollback(opts.data, current, next, err)
 	}
 	cfg, restore, err := reload.Prepare(raw)
 	if err != nil {
-		return nil, nil, rollback(data, current, next, err)
+		return nil, nil, rollback(opts.data, current, next, err)
 	}
-	probe := make([]string, len(next)-1)
-	for i, dev := range next[1:] {
-		probe[i] = dev.Name
-	}
-	if err := reload.Probe(cfg, probe); err != nil {
+	fronts, exits, nextGen, err := pool.SplitRoles(next)
+	if err != nil {
 		restore()
-		return nil, nil, rollback(data, current, next, err)
+		return nil, nil, rollback(opts.data, current, next, err)
 	}
-	if err := pool.Activate(data, next[0].Generation); err != nil {
+	probeFronts := deviceNames(fronts)
+	probeExits := deviceNames(exits)
+	if err := reload.Probe(cfg, probeFronts, probeExits); err != nil {
 		restore()
-		return nil, nil, rollback(data, current, next, err)
+		return nil, nil, rollback(opts.data, current, next, err)
+	}
+	if err := pool.Activate(opts.data, nextGen); err != nil {
+		restore()
+		return nil, nil, rollback(opts.data, current, next, err)
 	}
 	if err := reload.Promote(cfg); err != nil {
 		restore()
-		return nil, nil, rollback(data, current, next, err)
+		return nil, nil, rollback(opts.data, current, next, err)
 	}
-	if err := os.WriteFile(filepath.Join(data, "mihomo.yaml"), raw, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(opts.data, "mihomo.yaml"), raw, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "rotate: wrote live proxies but not mihomo.yaml: %v\n", err)
 	}
-	old := make([]string, len(current))
-	oldExits := make([]string, 0, len(current)-1)
+	oldGen := current[0].Generation
+	old := make([]string, 0, len(current)+1)
+	oldExits := make([]string, 0, len(current))
 	for i, dev := range current {
-		old[i] = dev.Name
+		old = append(old, dev.Name)
 		if dev.Role == pool.RoleExit {
 			oldExits = append(oldExits, dev.Name)
 		}
 		nxt := next[min(i, len(next)-1)]
 		fmt.Fprintf(os.Stderr, "rotate %s %s:%d -> %s %s:%d\n", dev.Name, dev.Server, dev.Port, nxt.Name, nxt.Server, nxt.Port)
 	}
-	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", next[0].Generation, current[0].Generation)
-	return next, &retiredGen{gen: current[0].Generation, names: old, exits: oldExits}, nil
+	old = append(old, pool.FrontGroupName(oldGen))
+	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", nextGen, oldGen)
+	return next, &retiredGen{gen: oldGen, names: old, exits: oldExits}, nil
+}
+
+func deviceNames(devices []pool.Device) []string {
+	names := make([]string, len(devices))
+	for i, d := range devices {
+		names[i] = d.Name
+	}
+	return names
 }
 
 func rollback(data string, current, failed []pool.Device, cause error) error {

@@ -110,12 +110,27 @@ func Promote(cfg *config.Config) error {
 	return nil
 }
 
-// Probe dials exits until one reaches the test URL. The front comes up as
-// that exit's dialer.
-func Probe(cfg *config.Config, exits []string) error {
+// Probe verifies every staged front directly, then dials staged exits until
+// one reaches the test URL through the staged front pool.
+func Probe(cfg *config.Config, fronts, exits []string) error {
 	ranges, err := utils.NewUnsignedRanges[uint16]("204")
 	if err != nil {
 		return err
+	}
+	if len(fronts) == 0 {
+		return fmt.Errorf("no front to probe")
+	}
+	for _, name := range fronts {
+		proxy, ok := cfg.Proxies[name]
+		if !ok {
+			return fmt.Errorf("missing proxy %s", name)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		_, err := proxy.URLTest(ctx, "https://www.gstatic.com/generate_204", ranges)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("probe front %s: %w", name, err)
+		}
 	}
 	var last error
 	for _, name := range exits {

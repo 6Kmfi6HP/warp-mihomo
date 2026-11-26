@@ -11,6 +11,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
+      WARP_FRONTS: "1"
       WARP_EXITS: "3"
       WARP_ROTATE: ${WARP_ROTATE:-1h}
       SKIP_SYSTEM_IPV6_CHECK: "1"

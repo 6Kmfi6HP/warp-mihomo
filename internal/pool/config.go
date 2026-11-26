@@ -11,18 +11,21 @@ func YAML(devices []Device, tun bool) ([]byte, error) {
 	return YAMLWithDirect(devices, tun, DirectRules{})
 }
 
-// YAMLWithDirect renders a mihomo config. The front dials MASQUE directly. Each exit
-// sets dialer-proxy to the front, and the load-balance group contains only
-// exits. With TUN, auto-redirect mark mode captures public egress, including
-// sockets bound to a namespace address. Local destinations are excluded before
-// DNS hijack and stay on the container network. Custom direct targets bypass
+// YAMLWithDirect renders a mihomo config. Front devices dial MASQUE directly and
+// sit in a generation-scoped front load-balance group. Each exit sets
+// dialer-proxy to that front group, and warp-pool load-balances across exits.
+// With TUN, auto-redirect mark mode captures public egress, including sockets
+// bound to a namespace address. Local destinations are excluded before DNS
+// hijack and stay on the container network. Custom direct targets bypass
 // warp-pool via DIRECT (and direct DoH resolution for domain entries). Mihomo
-// marks its own dials so the front and DIRECT dials still leave through the
+// marks its own dials so the fronts and DIRECT dials still leave through the
 // container NIC.
 func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, error) {
-	if len(devices) < 2 || devices[0].Role != RoleFront {
-		return nil, fmt.Errorf("yaml wants the front first, then exits")
+	fronts, exits, gen, err := SplitRoles(devices)
+	if err != nil {
+		return nil, err
 	}
+	frontGroup := FrontGroupName(gen)
 	var b strings.Builder
 	b.WriteString("allow-lan: false\n")
 	b.WriteString("mode: rule\n")
@@ -67,30 +70,20 @@ func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, err
 	b.WriteString("    - 1.1.1.1\n")
 	b.WriteString("\n")
 	b.WriteString("proxies:\n")
-	front := devices[0].Name
-	for i, d := range devices {
-		dialer := ""
-		if i > 0 {
-			dialer = front
+	for _, d := range fronts {
+		if err := writeProxy(&b, d, ""); err != nil {
+			return nil, err
 		}
-		if err := writeProxy(&b, d, dialer); err != nil {
+	}
+	for _, d := range exits {
+		if err := writeProxy(&b, d, frontGroup); err != nil {
 			return nil, err
 		}
 	}
 	b.WriteString("\n")
 	b.WriteString("proxy-groups:\n")
-	b.WriteString("  - name: " + PoolName + "\n")
-	b.WriteString("    type: load-balance\n")
-	b.WriteString("    strategy: round-robin\n")
-	b.WriteString("    lazy: true\n")
-	b.WriteString("    url: https://www.gstatic.com/generate_204\n")
-	b.WriteString("    expected-status: \"204\"\n")
-	b.WriteString("    interval: 300\n")
-	b.WriteString("    timeout: 5000\n")
-	b.WriteString("    proxies:\n")
-	for _, d := range devices[1:] {
-		b.WriteString("      - " + d.Name + "\n")
-	}
+	writeLoadBalanceGroup(&b, frontGroup, false, fronts)
+	writeLoadBalanceGroup(&b, PoolName, true, exits)
 	b.WriteString("\n")
 	if tun || len(direct.Domains) > 0 {
 		b.WriteString("rule-providers:\n")
@@ -137,6 +130,21 @@ func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, err
 	}
 	b.WriteString("  - MATCH," + PoolName + "\n")
 	return []byte(b.String()), nil
+}
+
+func writeLoadBalanceGroup(b *strings.Builder, name string, lazy bool, members []Device) {
+	b.WriteString("  - name: " + name + "\n")
+	b.WriteString("    type: load-balance\n")
+	b.WriteString("    strategy: round-robin\n")
+	fmt.Fprintf(b, "    lazy: %t\n", lazy)
+	b.WriteString("    url: https://www.gstatic.com/generate_204\n")
+	b.WriteString("    expected-status: \"204\"\n")
+	b.WriteString("    interval: 60\n")
+	b.WriteString("    timeout: 5000\n")
+	b.WriteString("    proxies:\n")
+	for _, d := range members {
+		b.WriteString("      - " + d.Name + "\n")
+	}
 }
 
 func writeProxy(b *strings.Builder, d Device, dialer string) error {
