@@ -268,10 +268,17 @@ func getenvBool(key string, fallback bool) bool {
 	}
 }
 
+const (
+	defaultDrainTimeout = 5 * time.Minute
+	defaultReapInterval = 15 * time.Second
+	defaultRetryDelay   = time.Minute
+)
+
 type retiredGen struct {
-	gen   int
-	names []string
-	exits []string
+	gen       int
+	names     []string
+	exits     []string
+	retiredAt time.Time
 }
 
 func rotateEvery() (time.Duration, error) {
@@ -292,29 +299,103 @@ func rotateEvery() (time.Duration, error) {
 	}
 }
 
+func drainTimeout(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultDrainTimeout
+	}
+	if half := interval / 2; half < defaultDrainTimeout {
+		if half < time.Second {
+			return time.Second
+		}
+		return half
+	}
+	return defaultDrainTimeout
+}
+
+func reapInterval(drain time.Duration) time.Duration {
+	if third := drain / 3; third < defaultReapInterval {
+		if third < time.Second {
+			return time.Second
+		}
+		return third
+	}
+	return defaultReapInterval
+}
+
+func rotateRetryDelay(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	if half := interval / 2; half < defaultRetryDelay {
+		if half < time.Second {
+			return time.Second
+		}
+		return half
+	}
+	return defaultRetryDelay
+}
+
 func rotateLoop(ctx context.Context, opts runOptions, interval time.Duration, current []pool.Device, direct pool.DirectRules) {
+	drain := drainTimeout(interval)
 	tick := time.NewTicker(interval)
-	reap := time.NewTicker(15 * time.Second)
+	reap := time.NewTicker(reapInterval(drain))
 	defer tick.Stop()
 	defer reap.Stop()
+
+	var retryTimer *time.Timer
+	var retryC <-chan time.Time
+	stopRetry := func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+			retryTimer = nil
+			retryC = nil
+		}
+	}
+	defer stopRetry()
+	scheduleRetry := func() {
+		delay := rotateRetryDelay(interval)
+		if delay <= 0 {
+			return
+		}
+		stopRetry()
+		retryTimer = time.NewTimer(delay)
+		retryC = retryTimer.C
+	}
+
 	var retired []retiredGen
-	fmt.Fprintf(os.Stderr, "rotate every %s\n", interval)
+	tryRotate := func() {
+		stopRetry()
+		// H3 endpoints only fit active + one retiring generation; finish any
+		// older draining generation before enrolling the next one.
+		retired = forceReapRetired(opts.data, retired)
+		if len(retired) > 0 {
+			fmt.Fprintf(os.Stderr, "rotate: %d retired generation(s) still present, retrying\n", len(retired))
+			scheduleRetry()
+			return
+		}
+		next, hold, err := rotateOnce(opts, current, direct)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "rotate: %v\n", err)
+			scheduleRetry()
+			return
+		}
+		current = next
+		if hold != nil {
+			retired = append(retired, *hold)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "rotate every %s (drain timeout %s)\n", interval, drain)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			next, hold, err := rotateOnce(opts, current, direct)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "rotate: %v\n", err)
-				continue
-			}
-			current = next
-			if hold != nil {
-				retired = append(retired, *hold)
-			}
+			tryRotate()
+		case <-retryC:
+			tryRotate()
 		case <-reap.C:
-			retired = reapRetired(opts.data, retired)
+			retired = reapRetired(opts.data, retired, drain, time.Now())
 		}
 	}
 }
@@ -367,7 +448,7 @@ func rotateOnce(opts runOptions, current []pool.Device, direct pool.DirectRules)
 	}
 	old = append(old, oldGroupNames...)
 	fmt.Fprintf(os.Stderr, "rotate generation %d serving, generation %d draining\n", plan.Gen, oldGen)
-	return next, &retiredGen{gen: oldGen, names: old, exits: oldExits}, nil
+	return next, &retiredGen{gen: oldGen, names: old, exits: oldExits, retiredAt: time.Now()}, nil
 }
 
 func buildProbeTracks(plan pool.Plan) []reload.ProbeTrack {
@@ -410,26 +491,84 @@ func rollback(data string, current, failed []pool.Device, cause error) error {
 	return cause
 }
 
-func reapRetired(data string, retired []retiredGen) []retiredGen {
+func reapRetired(data string, retired []retiredGen, drain time.Duration, now time.Time) []retiredGen {
+	return reapRetiredWith(data, retired, drain, now, false, liveChains(), closeGenerationConns, reload.Drop, pool.ForgetGeneration)
+}
+
+func forceReapRetired(data string, retired []retiredGen) []retiredGen {
+	return reapRetiredWith(data, retired, 0, time.Time{}, true, liveChains(), closeGenerationConns, reload.Drop, pool.ForgetGeneration)
+}
+
+func reapRetiredWith(
+	data string,
+	retired []retiredGen,
+	drain time.Duration,
+	now time.Time,
+	force bool,
+	chains [][]string,
+	closeConns func([]string) int,
+	dropProxies func([]string),
+	forgetGen func(string, int) error,
+) []retiredGen {
 	if len(retired) == 0 {
 		return retired
 	}
 	kept := retired[:0]
-	chains := liveChains()
 	for _, hold := range retired {
-		if !pool.GenerationIdle(hold.exits, chains) {
+		idle := pool.GenerationIdle(hold.exits, chains)
+		expired := force || (drain > 0 && !hold.retiredAt.IsZero() && now.Sub(hold.retiredAt) >= drain)
+		if !idle && !expired {
 			kept = append(kept, hold)
 			continue
 		}
-		reload.Drop(hold.names)
-		if err := pool.ForgetGeneration(data, hold.gen); err != nil {
+		if !idle {
+			closed := closeConns(hold.names)
+			fmt.Fprintf(os.Stderr, "rotate: force-closing generation %d after drain (closed %d connections)\n", hold.gen, closed)
+		}
+		dropProxies(hold.names)
+		if err := forgetGen(data, hold.gen); err != nil {
 			fmt.Fprintf(os.Stderr, "rotate: forget generation %d: %v\n", hold.gen, err)
 			kept = append(kept, hold)
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "rotate: closed idle generation %d\n", hold.gen)
+		if idle {
+			fmt.Fprintf(os.Stderr, "rotate: closed idle generation %d\n", hold.gen)
+		} else {
+			fmt.Fprintf(os.Stderr, "rotate: closed generation %d after drain timeout\n", hold.gen)
+		}
 	}
 	return kept
+}
+
+func closeGenerationConns(names []string) int {
+	snap := statistic.DefaultManager.Snapshot()
+	if snap == nil {
+		return 0
+	}
+	target := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		target[name] = struct{}{}
+	}
+	closed := 0
+	for _, conn := range snap.Connections {
+		if conn == nil || !chainMatches(conn.Chain, target) {
+			continue
+		}
+		if tracker := statistic.DefaultManager.Get(conn.UUID.String()); tracker != nil {
+			_ = tracker.Close()
+			closed++
+		}
+	}
+	return closed
+}
+
+func chainMatches(chain []string, target map[string]struct{}) bool {
+	for _, name := range chain {
+		if _, ok := target[name]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func liveChains() [][]string {

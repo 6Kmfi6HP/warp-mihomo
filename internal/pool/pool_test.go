@@ -339,6 +339,58 @@ func TestRotateKeepsOldGeneration(t *testing.T) {
 	}
 }
 
+func TestRotateConsecutiveSixH3GenerationsAndZeroEnrollOnExhaustion(t *testing.T) {
+	dir := t.TempDir()
+	calls := 0
+	reg := func(name string) (warp.Identity, error) {
+		calls++
+		return warp.Identity{
+			PrivateKey: "priv-" + name,
+			PublicKey:  "pub-" + name,
+			IP:         "172.16.0.2",
+			IPv6:       "2606:4700:110::" + name,
+		}, nil
+	}
+	spec := Spec{FrontsH3: 3, ExitsH3: 3, FrontsH2: 1, ExitsH2: 1}
+	unlock, err := Lock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	cur, err := Ensure(dir, spec, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := range 4 {
+		next, err := Rotate(dir, spec, reg)
+		if err != nil {
+			t.Fatalf("round %d rotate: %v", round, err)
+		}
+		if err := Activate(dir, next[0].Generation); err != nil {
+			t.Fatalf("round %d activate: %v", round, err)
+		}
+		if err := ForgetGeneration(dir, cur[0].Generation); err != nil {
+			t.Fatalf("round %d forget: %v", round, err)
+		}
+		cur = next
+	}
+
+	// Keep active (gen 4) and also stage gen 5 without forgetting gen 4:
+	// 6 + 6 = 12 H3 endpoints used out of 14. Attempting gen 6 must fail before
+	// calling reg() once.
+	if _, err := Rotate(dir, spec, reg); err != nil {
+		t.Fatalf("staging extra generation failed: %v", err)
+	}
+	callsBefore := calls
+	if _, err := Rotate(dir, spec, reg); err == nil {
+		t.Fatal("expected error when 12/14 H3 endpoints are already occupied")
+	}
+	if calls != callsBefore {
+		t.Fatalf("Rotate called reg %d times despite exhausted H3 endpoints", calls-callsBefore)
+	}
+}
+
 func TestEnsureRejectsSecondLock(t *testing.T) {
 	dir := t.TempDir()
 	unlock, err := Lock(dir)

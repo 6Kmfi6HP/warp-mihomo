@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/tunnel"
 
@@ -122,6 +124,13 @@ func TestPrepareKeepsPoolUntilPromote(t *testing.T) {
 	if _, ok := tunnel.Proxies()[pool.FrontGroupName(pool.NetworkH2, 1)]; !ok {
 		t.Fatal("new h2 front pool was removed by Drop")
 	}
+	Drop([]string{
+		pool.PoolName,
+		"warp-exit-h3-g1-1", "warp-exit-h2-g1-1",
+		"warp-front-h3-g1-1", "warp-front-h3-g1-2", "warp-front-h2-g1-1",
+		pool.FrontGroupName(pool.NetworkH3, 1),
+		pool.FrontGroupName(pool.NetworkH2, 1),
+	})
 }
 
 func TestPreparePreservesRoutingMark(t *testing.T) {
@@ -222,5 +231,43 @@ func mustDev(t *testing.T, role, network string, gen int, name, server string, p
 		IPv6:       "2606:4700:110::1",
 		Server:     server,
 		Port:       port,
+	}
+}
+
+func TestProbeTracksPartialFrontFailureAndAllFail(t *testing.T) {
+	tracks := []ProbeTrack{{
+		Name:   "h3",
+		Fronts: []string{"front-1", "front-2"},
+		Exits:  []string{"exit-1", "exit-2"},
+	}}
+
+	// One front fails and one front succeeds; first exit fails and second succeeds.
+	var probed []string
+	err := probeTracksWith(nil, tracks, func(_ *config.Config, name string) error {
+		probed = append(probed, name)
+		switch name {
+		case "front-1", "exit-1":
+			return errors.New("timeout")
+		default:
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("expected partial front failure to pass, got %v", err)
+	}
+	wantProbed := []string{"front-1", "front-2", "exit-1", "exit-2"}
+	if strings.Join(probed, ",") != strings.Join(wantProbed, ",") {
+		t.Fatalf("probed = %v, want %v", probed, wantProbed)
+	}
+
+	// All fronts fail -> returns first front error without probing exits.
+	err = probeTracksWith(nil, tracks, func(_ *config.Config, name string) error {
+		if strings.HasPrefix(name, "exit-") {
+			t.Fatalf("exit %s should not be probed when all fronts failed", name)
+		}
+		return errors.New("udp blocked")
+	})
+	if err == nil || !strings.Contains(err.Error(), "probe h3 front front-1") {
+		t.Fatalf("expected first front error, got %v", err)
 	}
 }

@@ -183,19 +183,49 @@ func Rotate(dir string, spec Spec, reg Registrar) ([]Device, error) {
 		{RoleExit, NetworkH3, spec.ExitsH3},
 		{RoleExit, NetworkH2, spec.ExitsH2},
 	}
+	type plannedDevice struct {
+		role    string
+		network string
+		name    string
+		server  string
+		port    int
+	}
+	planned := make([]plannedDevice, 0, spec.FrontsH3+spec.FrontsH2+spec.ExitsH3+spec.ExitsH2)
+	scratch := slices.Clone(state.Devices)
 	for _, t := range targets {
 		for range t.want {
-			name := nextRoleName(state.Devices, gen, t.role, t.net)
-			id, err := reg(name)
-			if err != nil {
-				return nil, fmt.Errorf("enroll %s: %w", name, err)
-			}
-			dev, err := newDevice(t.role, t.net, name, gen, id, endpoints)
+			name := nextRoleName(scratch, gen, t.role, t.net)
+			server, port, err := endpoints.pickEndpoint(t.net)
 			if err != nil {
 				return nil, err
 			}
-			state.Devices = append(state.Devices, dev)
+			planned = append(planned, plannedDevice{
+				role:    t.role,
+				network: t.net,
+				name:    name,
+				server:  server,
+				port:    port,
+			})
+			scratch = append(scratch, Device{
+				Role:       t.role,
+				Network:    t.net,
+				Name:       name,
+				Generation: gen,
+				Server:     server,
+				Port:       port,
+			})
 		}
+	}
+	for _, p := range planned {
+		id, err := reg(p.name)
+		if err != nil {
+			return nil, fmt.Errorf("enroll %s: %w", p.name, err)
+		}
+		dev, err := buildDevice(p.role, p.network, p.name, gen, id, p.server, p.port)
+		if err != nil {
+			return nil, err
+		}
+		state.Devices = append(state.Devices, dev)
 	}
 	if err := save(dir, state); err != nil {
 		return nil, err
@@ -236,11 +266,15 @@ func enrollTrackDeficit(dir string, state *fileState, gen int, role, network str
 	have := countGenerationRoleNetwork(state.Devices, gen, role, network)
 	for have < want {
 		name := nextRoleName(state.Devices, gen, role, network)
+		server, port, err := endpoints.pickEndpoint(network)
+		if err != nil {
+			return err
+		}
 		id, err := reg(name)
 		if err != nil {
 			return fmt.Errorf("enroll %s: %w", name, err)
 		}
-		dev, err := newDevice(role, network, name, gen, id, endpoints)
+		dev, err := buildDevice(role, network, name, gen, id, server, port)
 		if err != nil {
 			return err
 		}
@@ -402,23 +436,20 @@ func (p *endpointPool) pickH2Endpoint() (string, int, error) {
 	return fmt.Sprintf("162.159.198.%d", octet), port, nil
 }
 
-func newDevice(role, network, name string, gen int, id warp.Identity, endpoints *endpointPool) (Device, error) {
-	if id.PrivateKey == "" || id.PublicKey == "" || id.IP == "" || id.IPv6 == "" {
-		return Device{}, fmt.Errorf("enrollment %s returned an empty field", name)
-	}
-	var server string
-	var port int
-	var err error
+func (p *endpointPool) pickEndpoint(network string) (string, int, error) {
 	switch network {
 	case NetworkH3:
-		server, port, err = endpoints.pickH3Endpoint()
+		return p.pickH3Endpoint()
 	case NetworkH2:
-		server, port, err = endpoints.pickH2Endpoint()
+		return p.pickH2Endpoint()
 	default:
-		return Device{}, fmt.Errorf("unsupported network %q", network)
+		return "", 0, fmt.Errorf("unsupported network %q", network)
 	}
-	if err != nil {
-		return Device{}, err
+}
+
+func buildDevice(role, network, name string, gen int, id warp.Identity, server string, port int) (Device, error) {
+	if id.PrivateKey == "" || id.PublicKey == "" || id.IP == "" || id.IPv6 == "" {
+		return Device{}, fmt.Errorf("enrollment %s returned an empty field", name)
 	}
 	return Device{
 		Role:       role,

@@ -101,7 +101,7 @@ func YAMLWithDirect(devices []Device, tun bool, direct DirectRules) ([]byte, err
 	if len(plan.FrontsH2) > 0 {
 		writeLoadBalanceGroup(&b, frontH2Group, false, plan.FrontsH2)
 	}
-	writeLoadBalanceGroup(&b, PoolName, true, plan.Exits())
+	writeLoadBalanceGroup(&b, PoolName, false, plan.Exits())
 	b.WriteString("\n")
 	if tun || len(direct.Domains) > 0 {
 		b.WriteString("rule-providers:\n")

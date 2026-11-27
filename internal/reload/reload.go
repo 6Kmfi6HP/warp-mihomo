@@ -8,6 +8,7 @@ package reload
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
@@ -97,8 +98,10 @@ func Promote(cfg *config.Config) error {
 		return fmt.Errorf("config has no %s group", pool.PoolName)
 	}
 	merged := cloneProxies(tunnel.Proxies())
+	previousPool := merged[pool.PoolName]
 	merged[pool.PoolName] = group
 	tunnel.UpdateProxies(merged, cfg.Providers)
+	closeProxyProviders(previousPool)
 	for _, provider := range cfg.Providers {
 		if provider.Type() != P.Proxy {
 			continue
@@ -124,12 +127,19 @@ func Probe(cfg *config.Config, fronts, exits []string) error {
 }
 
 // ProbeTracks verifies every enabled protocol track: all fronts in each track
-// must succeed, and at least one exit in each track must reach the test URL.
+// are probed so unhealthy fronts are marked down, at least one front in each
+// track must succeed, and at least one exit in each track must reach the test URL.
 func ProbeTracks(cfg *config.Config, tracks []ProbeTrack) error {
 	ranges, err := utils.NewUnsignedRanges[uint16]("204")
 	if err != nil {
 		return err
 	}
+	return probeTracksWith(cfg, tracks, func(cfg *config.Config, name string) error {
+		return probeProxy(cfg, name, ranges)
+	})
+}
+
+func probeTracksWith(cfg *config.Config, tracks []ProbeTrack, probe func(*config.Config, string) error) error {
 	if len(tracks) == 0 {
 		return fmt.Errorf("no track to probe")
 	}
@@ -137,23 +147,32 @@ func ProbeTracks(cfg *config.Config, tracks []ProbeTrack) error {
 		if len(track.Fronts) == 0 {
 			return fmt.Errorf("track %s has no front to probe", track.Name)
 		}
+		if len(track.Exits) == 0 {
+			return fmt.Errorf("track %s has no exit to probe", track.Name)
+		}
+		var firstFrontErr error
+		frontOK := false
 		for _, name := range track.Fronts {
-			if err := probeProxy(cfg, name, ranges); err != nil {
-				return fmt.Errorf("probe %s front %s: %w", track.Name, name, err)
+			if err := probe(cfg, name); err != nil {
+				if firstFrontErr == nil {
+					firstFrontErr = fmt.Errorf("probe %s front %s: %w", track.Name, name, err)
+				}
+				continue
 			}
+			frontOK = true
+		}
+		if !frontOK {
+			return firstFrontErr
 		}
 		var last error
 		for _, name := range track.Exits {
-			last = probeProxy(cfg, name, ranges)
+			last = probe(cfg, name)
 			if last == nil {
 				break
 			}
 		}
 		if last != nil {
 			return fmt.Errorf("probe %s exits: %w", track.Name, last)
-		}
-		if len(track.Exits) == 0 {
-			return fmt.Errorf("track %s has no exit to probe", track.Name)
 		}
 	}
 	return nil
@@ -189,7 +208,32 @@ func closeNew(cfg *config.Config, previous map[string]C.Proxy) {
 		if _, exists := previous[name]; exists {
 			continue
 		}
+		closeProxyProviders(proxy)
 		_ = proxy.Close()
+	}
+	for _, provider := range cfg.Providers {
+		closeProvider(provider)
+	}
+}
+
+func closeProxyProviders(proxy C.Proxy) {
+	if proxy == nil {
+		return
+	}
+	adapter := proxy.Adapter()
+	if adapter == nil {
+		return
+	}
+	if group, ok := adapter.(interface{ Providers() []P.ProxyProvider }); ok {
+		for _, provider := range group.Providers() {
+			closeProvider(provider)
+		}
+	}
+}
+
+func closeProvider(provider P.ProxyProvider) {
+	if closer, ok := provider.(io.Closer); ok {
+		_ = closer.Close()
 	}
 }
 
@@ -202,6 +246,7 @@ func Drop(names []string) {
 		if !ok {
 			continue
 		}
+		closeProxyProviders(proxy)
 		_ = proxy.Close()
 		delete(merged, name)
 	}
